@@ -17,6 +17,13 @@ import subprocess
 import sys
 from typing import Any
 
+try:
+    from .performance import run_pressure_gate
+except ImportError:
+    # Keep the documented direct-script entrypoint working.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from evaluator.performance import run_pressure_gate
+
 
 SUMMARY_RE = re.compile(r"(?:(\d+) passed)?(?:, )?(?:(\d+) failed)?")
 
@@ -92,8 +99,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--pressure-count", type=int, default=0,
+        help="also run the deterministic correctness-first pressure gate",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="pressure workload seed")
+    parser.add_argument("--shard", type=int, default=0, help="zero-based pressure shard")
+    parser.add_argument("--shards", type=int, default=1, help="number of pressure shards")
     args = parser.parse_args(argv)
     result = run(args.repo, args.tests, python=args.python)
+    if args.pressure_count:
+        pressure = run_pressure_gate(
+            count=args.pressure_count,
+            seed=args.seed,
+            shard=args.shard,
+            shards=args.shards,
+        )
+        result["pressure"] = pressure.as_dict()
+        result["valid"] = bool(result.get("valid") and pressure.ok)
     text = json.dumps(result, indent=2, sort_keys=True) + "\n"
     print(text, end="")
     if args.out:

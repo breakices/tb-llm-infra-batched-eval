@@ -6,6 +6,7 @@ import json
 
 from .oracle import generate as oracle_generate
 from .tiny_evaluator import EvalRequest, TinyBatchRuntime, TinyEvaluator
+from .gate import GateConfig, run_gate
 
 
 def run() -> dict[str, object]:
@@ -51,10 +52,13 @@ def run() -> dict[str, object]:
     if 0 in eos_output:
         assert eos_output.index(0) + 1 >= eos_request.min_new_tokens
 
+    gate = run_gate(GateConfig(case_count=192, performance_repetitions=1))
+    assert gate.ok, gate.as_dict()
     return {
         "ok": True,
         "packed": packed.as_dict(),
         "padded": padded.as_dict(),
+        "gate": gate.as_dict(),
     }
 
 
