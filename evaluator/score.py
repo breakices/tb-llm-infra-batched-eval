@@ -19,10 +19,10 @@ from typing import Any
 
 try:
     from .performance import run_pressure_gate
-except ImportError:
-    # Keep the documented direct-script entrypoint working.
+except ImportError:  # support ``python evaluator/score.py`` as well as -m
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from evaluator.performance import run_pressure_gate
+
 
 
 SUMMARY_RE = re.compile(r"(?:(\d+) passed)?(?:, )?(?:(\d+) failed)?")
