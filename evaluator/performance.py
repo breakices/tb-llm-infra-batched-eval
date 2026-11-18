@@ -147,8 +147,11 @@ def run_pressure_gate(
     }
     limit = len(unique_semantics) if max_model_calls is None else int(max_model_calls)
     calls = int(runtime.stats.model_calls)
-    performance_ok = calls <= limit
-    if not performance_ok and not reason:
+    # Pressure is a post-correctness gate.  A candidate that emits the wrong
+    # sequence never receives a performance pass, even if its counters look
+    # efficient.  This keeps the ordering explicit for private diagnostics.
+    performance_ok = bool(correctness_ok and calls <= limit)
+    if not performance_ok and correctness_ok and not reason:
         reason = f"model_calls={calls} exceeds max_model_calls={limit}"
     return PressureGateResult(
         ok=bool(correctness_ok and performance_ok),
