@@ -9,7 +9,7 @@ independent oracle in :mod:`evaluator.oracle`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 import random
 from numbers import Integral, Real
@@ -625,7 +625,7 @@ def weighted_metrics(
             },
             [],
         )
-    total_weight = sum(float(request.weight) for request in requests)
+    total_weight = math.fsum(float(request.weight) for request in requests)
     if total_weight <= 0:
         raise ValueError("at least one request must have positive weight")
     records: list[dict[str, Any]] = []
@@ -644,8 +644,8 @@ def weighted_metrics(
         exact = float(actual == expected)
         token_score = _token_accuracy(actual, expected)
         weight = float(request.weight)
-        exact_weight += weight * exact
-        token_weight += weight * token_score
+        exact_weight = math.fsum((exact_weight, weight * exact))
+        token_weight = math.fsum((token_weight, weight * token_score))
         exact_count += int(exact)
         token_sum += token_score
         records.append(
@@ -765,6 +765,8 @@ def pmi_score(
         weight=request.weight,
         reference=request.reference,
         context_length=request.context_length,
+        seed=request.seed,
+        shard=request.shard,
     )
     return float(conditional - sequence_logprob(baseline, continuation))
 
@@ -787,6 +789,7 @@ def dc_pmi_score(
     if not supports:
         return pmi
     values: list[float] = []
+    support_weights: list[float] = []
     for row in supports:
         support_request = EvalRequest(
             request_id=row.request_id,
@@ -801,8 +804,14 @@ def dc_pmi_score(
             context_length=request.context_length,
         )
         target = row.continuation if continuation is None else tuple(continuation)
+        if row.weight <= 0:
+            continue
         values.append(pmi_score(support_request, target))
-    return float(pmi - sum(values) / len(values))
+        support_weights.append(float(row.weight))
+    if not values:
+        return float(pmi)
+    baseline = math.fsum(value * weight for value, weight in zip(values, support_weights)) / math.fsum(support_weights)
+    return float(pmi - baseline)
 
 
 # Short aliases are intentionally exported because independent benchmark
@@ -835,22 +844,22 @@ def batch_calibration(
         raise ValueError("weights must be finite and non-negative")
     probs = [min(1.0, max(0.0, float(probability))) for probability in predictions]
     truths = [1.0 if bool(label) else 0.0 for label in labels]
-    total = sum(row_weights)
+    total = math.fsum(row_weights)
     if not probs or total <= 0:
         return {"brier": 0.0, "logloss": 0.0, "ece": 0.0, "accuracy": 0.0, "total_weight": total, "num_rows": float(len(probs))}
-    brier = sum(weight * (probability - truth) ** 2 for probability, truth, weight in zip(probs, truths, row_weights)) / total
+    brier = math.fsum(weight * (probability - truth) ** 2 for probability, truth, weight in zip(probs, truths, row_weights)) / total
     eps = 1e-15
-    logloss = -sum(weight * (truth * math.log(max(eps, probability)) + (1 - truth) * math.log(max(eps, 1 - probability))) for probability, truth, weight in zip(probs, truths, row_weights)) / total
-    accuracy = sum(weight for probability, truth, weight in zip(probs, truths, row_weights) if (probability >= 0.5) == bool(truth)) / total
+    logloss = -math.fsum(weight * (truth * math.log(max(eps, probability)) + (1 - truth) * math.log(max(eps, 1 - probability))) for probability, truth, weight in zip(probs, truths, row_weights)) / total
+    accuracy = math.fsum(weight for probability, truth, weight in zip(probs, truths, row_weights) if (probability >= 0.5) == bool(truth)) / total
     ece = 0.0
     for bin_index in range(bins):
         low = bin_index / bins
         high = (bin_index + 1) / bins
         selected = [index for index, probability in enumerate(probs) if low <= probability < high or (bin_index == bins - 1 and probability == high)]
-        weight = sum(row_weights[index] for index in selected)
+        weight = math.fsum(row_weights[index] for index in selected)
         if weight:
-            mean_probability = sum(probs[index] * row_weights[index] for index in selected) / weight
-            mean_truth = sum(truths[index] * row_weights[index] for index in selected) / weight
+            mean_probability = math.fsum(probs[index] * row_weights[index] for index in selected) / weight
+            mean_truth = math.fsum(truths[index] * row_weights[index] for index in selected) / weight
             ece += weight / total * abs(mean_probability - mean_truth)
     return {"brier": float(brier), "logloss": float(logloss), "ece": float(ece), "accuracy": float(accuracy), "total_weight": total, "num_rows": float(len(probs))}
 
@@ -902,7 +911,8 @@ class TinyEvaluator:
         refs = None if references is None else [tuple(value) for value in references]
         if refs is not None and len(refs) != len(rows):
             raise ValueError("references must align with requests")
-        result = self.run(rows, mode=mode)
+        scoring_rows = rows if refs is None else [replace(row, reference=refs[index]) for index, row in enumerate(rows)]
+        result = self.run(scoring_rows, mode=mode)
         expected = [refs[i] if refs is not None else tuple(oracle_generate(row.as_oracle_request())) for i, row in enumerate(rows)]
         padded = self.runtime.generate_batch(rows, mode="padded")
         return {"outputs": result.outputs, "predictions": result.outputs, "padded": padded, "packed": result.outputs, "mode_parity": padded == result.outputs, "oracle_parity": result.outputs == [list(value) for value in expected], "metrics": result.metrics, "records": result.records, "exact_match": result.metrics["weighted_exact_match"], "token_accuracy": result.metrics["weighted_token_accuracy"], "total_weight": result.metrics["total_weight"]}
