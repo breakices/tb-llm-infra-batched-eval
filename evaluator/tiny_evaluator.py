@@ -316,7 +316,10 @@ def _apply_stop_bytes(
         starts.append(len(encoded))
         value = int(token)
         output.append(value)
-        encoded.append(value % 256)
+        if 0 <= value <= 255:
+            encoded.append(value)
+        else:
+            encoded.extend(str(value).encode("utf-8"))
         if index + 1 < minimum:
             continue
         for marker in stop_sequences:
