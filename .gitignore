@@ -1,0 +1,6 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+score*.json
+raw.json
+run-meta.json
