@@ -37,6 +37,9 @@ class Request:
     # fields so old positional callers keep their meaning.
     stop_sequences: tuple[Any, ...] = ()
     stop: tuple[Any, ...] = ()
+    context_length: int | None = None
+    seed: int | None = None
+    shard: int | None = None
 
 
 def _freeze(value: Any) -> Any:
@@ -254,6 +257,12 @@ class BatchEngine:
             or float(request.weight) < 0
         ):
             raise ValueError("weight must be a finite non-negative number")
+        if request.context_length is not None and (not _is_int(request.context_length) or request.context_length < 0):
+            raise ValueError("context_length must be a non-negative integer or None")
+        for name in ("seed", "shard"):
+            value = getattr(request, name, None)
+            if value is not None and not _is_int(value):
+                raise ValueError(f"{name} must be an integer or None")
         try:
             prompt = tuple(request.prompt)
         except TypeError:
@@ -270,7 +279,16 @@ class BatchEngine:
             id(model),
             _freeze(request.adapter),
             ("temperature", float(request.temperature)),
+            request.context_length,
+            request.seed,
+            request.shard,
         )
+
+    @staticmethod
+    def _effective_prompt(request):
+        prompt = tuple(request.prompt)
+        limit = request.context_length
+        return prompt if limit is None else (prompt[-limit:] if limit else ())
 
     def _result_key(self, request):
         """Key cached raw generations by every output-affecting option.
@@ -284,7 +302,7 @@ class BatchEngine:
 
         return (
             self._context_key(request),
-            _freeze(tuple(request.prompt)),
+            _freeze(self._effective_prompt(request)),
             int(request.max_new_tokens),
             int(request.min_new_tokens),
             None if request.eos_token_id is None else _freeze(request.eos_token_id),
@@ -297,7 +315,7 @@ class BatchEngine:
     def _ensure_prefix(self, request, model):
         """Populate prefix state and count reuse of a previously seen prefix."""
 
-        prompt = tuple(request.prompt)
+        prompt = self._effective_prompt(request)
         if not prompt:
             return
         context = self._context_key(request)
@@ -414,7 +432,7 @@ class BatchEngine:
         if not requests:
             return []
         max_tokens = max(request.max_new_tokens for request in requests)
-        prompts = [tuple(request.prompt) for request in requests]
+        prompts = [self._effective_prompt(request) for request in requests]
         if mode == "padded":
             width = max((len(prompt) for prompt in prompts), default=0)
             # Count the full rectangular work surface.  This includes real
