@@ -304,10 +304,16 @@ def batch_calibration(
 
 
 calibrate_batch = batch_calibration
+calibration = batch_calibration
+calibrate = batch_calibration
+compute_logprob = sequence_logprob
+compute_pmi = pmi_score
+compute_dc_pmi = dc_pmi_score
 
 
 __all__ = [
-    "CalibrationResult", "batch_calibration", "batch_logprob", "calibrate_batch",
+    "CalibrationResult", "batch_calibration", "batch_logprob", "calibrate_batch", "calibration", "calibrate",
+    "compute_logprob", "compute_pmi", "compute_dc_pmi",
     "conditional_logprob", "dc_pmi", "dc_pmi_score", "logprob", "pmi", "pmi_score",
     "score_logprob", "sequence_logprob",
 ]

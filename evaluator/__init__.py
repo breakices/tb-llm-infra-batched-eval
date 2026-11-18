@@ -73,6 +73,6 @@ __all__ = [
 ]
 
 from .performance import PressureGateResult, run_pressure_gate, seeded_pressure_requests
-from .metrics_v3 import CalibrationResult, batch_logprob, calibrate_batch
+from .metrics_v3 import (CalibrationResult, batch_logprob, calibrate_batch, calibration as metrics_calibration, calibrate, compute_logprob, compute_pmi, compute_dc_pmi)
 
-__all__ += ["CalibrationResult", "batch_logprob", "calibrate_batch"]
+__all__ += ["CalibrationResult", "batch_logprob", "calibrate_batch", "metrics_calibration", "calibrate", "compute_logprob", "compute_pmi", "compute_dc_pmi"]
