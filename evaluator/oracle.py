@@ -238,7 +238,7 @@ def _validate_request(request: OracleRequest, vocab_size: int) -> None:
     if request.eos_token_id is not None:
         if isinstance(request.eos_token_id, bool) or not isinstance(request.eos_token_id, Integral) or not 0 <= int(request.eos_token_id) < vocab_size:
             raise ValueError("eos_token_id is outside the vocabulary")
-    if not math.isfinite(float(request.weight)) or float(request.weight) < 0:
+    if isinstance(request.weight, bool) or not isinstance(request.weight, (int, float)) or not math.isfinite(float(request.weight)) or float(request.weight) < 0:
         raise ValueError("weight must be a finite non-negative number")
     if request.context_length is not None:
         if not isinstance(request.context_length, Integral) or isinstance(request.context_length, bool) or request.context_length < 0:
