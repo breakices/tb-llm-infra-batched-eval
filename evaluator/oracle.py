@@ -53,13 +53,6 @@ class OracleRequest:
     max_context_tokens: Optional[int] = None
     continuation: Optional[tuple[Any, ...]] = None
     stop_strings: tuple[Any, ...] = ()
-    # Compatibility aliases used by older hidden harnesses.
-    support: tuple[Any, ...] = ()
-    context_window: Optional[int] = None
-    max_context_tokens: Optional[int] = None
-    continuation: Optional[tuple[Any, ...]] = None
-    stop_strings: tuple[Any, ...] = ()
-
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", tuple(self.prompt))
         if self.reference is not None:
