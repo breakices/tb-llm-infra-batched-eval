@@ -270,8 +270,6 @@ def selfcheck() -> dict[str, Any]:
     shards = [select_shard(cases_a, i, 4) for i in range(4)]
     if sum((len(shard) for shard in shards), 0) != len(cases_a):
         raise AssertionError("shards do not cover the corpus")
-    if {id(case) for shard in shards for case in shard} & set():
-        pass
     golden = run_gate(GateConfig(case_count=DEFAULT_CASE_COUNT, performance_repetitions=1))
     if not golden.ok:
         raise AssertionError(f"default gate failed: {golden.as_dict()}")
