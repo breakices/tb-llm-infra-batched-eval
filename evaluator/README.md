@@ -27,3 +27,15 @@ python3 -m evaluator.score --repo golden-repo --out /tmp/golden-score.json
 The private suite is intentionally kept outside the runtime package in a
 normal benchmark deployment.  The local prototype stores it under `tests/` so
 the Golden/NOP loop can be run on the development machine.
+
+## v3 parity surface
+
+The v3 evaluator keeps the v1/v2 constructors and adds `SupportRow` and
+`PrefixHint` records, optional support aliases, finite right-context
+truncation, deterministic seed/shard isolation, and byte/token stop markers.
+`TinyBatchRuntime` runs padded and packed layouts through the same independent
+oracle while preserving duplicate input rows and weights. `sequence_logprob`,
+`pmi_score`, `dc_pmi_score`, and `batch_calibration` provide deterministic
+probability diagnostics. `evaluator.gate` builds a 192-row Unicode/bool/int
+corpus and runs correctness before the model-work pressure gate. Use
+`python -m evaluator.selfcheck` for the complete local closure.

@@ -9,7 +9,27 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import ast
+import re
+
+
+def _collected_count(selected, *, env, cwd):
+    """Count parametrized test cases from pytest's collection output.
+
+    Counting only ``test_*`` function definitions undercounts a matrix-heavy
+    private suite.  Collection runs against the fixed verifier files and
+    therefore reports the actual number of rows executed without trusting
+    candidate code or a hand-maintained constant.
+    """
+
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *(str(path) for path in selected)],
+        env=env,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    match = re.search(r"(\d+)\s+tests?\s+collected", collected.stdout)
+    return int(match.group(1)) if match else 0
 
 
 def main() -> int:
@@ -42,14 +62,7 @@ def main() -> int:
         capture_output=True,
         text=True,
     )
-    total = sum(
-        sum(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test_")
-            for node in ast.walk(ast.parse(path.read_text()))
-        )
-        for path in selected
-    )
+    total = _collected_count(selected, env=env, cwd=tests.parent)
     passed = 0
     # Pytest's summary is intentionally not used as the source of truth for
     # validity. A non-zero exit code or a missing test file is always invalid.

@@ -54,3 +54,15 @@ input rows are permuted.
 Keep the implementation dependency-free. Do not use network services,
 credentials, model downloads, or changes outside the task's `repo/` runtime
 when implementing the requested runtime behavior.
+
+## v3 local evaluator contract
+
+The local evaluator now accepts support rows and named prefix hints, rejects
+conflicting hints, truncates to a finite right context, and isolates caches by
+model, adapter, tenant, normalized temperature, seed, shard, and model
+lifecycle. Padded and packed execution must remain byte-for-byte identical.
+Generation supports EOS and minimum lengths together with byte/token stop
+markers. Independent logprob, PMI, DC-PMI, and weighted calibration helpers
+must stay finite for empty support and duplicate rows. The deterministic gate
+runs its 192-case corpus and hidden-style shards only after exact oracle
+correctness passes, then checks model-work pressure.

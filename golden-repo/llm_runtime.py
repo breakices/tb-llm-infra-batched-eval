@@ -32,6 +32,11 @@ class Request:
     eos_token_id: int | None = None
     request_id: Any = None
     weight: float = 1.0
+    # Optional byte/token-level stop sequences. Both names are accepted for
+    # compatibility with common serving APIs. They are after the original
+    # fields so old positional callers keep their meaning.
+    stop_sequences: tuple[Any, ...] = ()
+    stop: tuple[Any, ...] = ()
 
 
 def _freeze(value: Any) -> Any:
@@ -58,9 +63,61 @@ def _is_int(value: Any) -> bool:
 
 
 def _is_prompt_token(value: Any) -> bool:
-    """Prompt tokens may be booleans, whose identity remains cache-visible."""
+    """Return whether a prompt token has a deterministic byte/numeric value.
 
-    return isinstance(value, Integral)
+    Integer tokens remain the normal path. ``str`` and bytes-like tokens are
+    accepted as well so byte-level and Unicode tokenizer fixtures can exercise
+    the runtime without a third-party tokenizer.
+    """
+
+    return isinstance(value, (Integral, str, bytes, bytearray, memoryview))
+
+
+def _token_value(value: Any) -> int:
+    """Map a prompt token to a stable arithmetic contribution."""
+
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, str):
+        return sum((index + 1) * ord(char) for index, char in enumerate(value))
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        return sum((index + 1) * byte for index, byte in enumerate(value))
+    return sum((index + 1) * ord(char) for index, char in enumerate(str(value)))
+
+
+def _token_bytes(value: Any) -> bytes:
+    """Encode one token for byte-level stop matching."""
+
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if isinstance(value, Integral):
+        number = int(value)
+        if 0 <= number <= 255:
+            return bytes((number,))
+        return str(number).encode("utf-8")
+    return str(value).encode("utf-8")
+
+
+def _stop_sequences(request: Request) -> tuple[Any, ...]:
+    """Normalize either stop field into one immutable sequence."""
+
+    values: list[Any] = []
+    for source in (request.stop_sequences, request.stop):
+        if source is None:
+            continue
+        if isinstance(source, (str, bytes, bytearray, memoryview, Integral)):
+            values.append(source)
+        else:
+            values.extend(source)
+    return tuple(values)
 
 
 class ToyModel:
@@ -74,7 +131,7 @@ class ToyModel:
 
     def _raw_tokens(self, prompt, adapter, temperature, max_new_tokens):
         salt = sum(ord(c) for c in (str(self.model_id) + str(adapter))) % 97
-        seed = (sum(prompt) + salt + int(temperature * 1000)) % 1000
+        seed = (sum(_token_value(token) for token in prompt) + salt + int(temperature * 1000)) % 1000
         return [((seed + i * 17) % 101) for i in range(max_new_tokens)]
 
     def next_tokens(self, prompt, adapter, temperature, max_new_tokens):
@@ -179,14 +236,24 @@ class BatchEngine:
             raise ValueError("min_new_tokens must be non-negative")
         if request.min_new_tokens > request.max_new_tokens:
             raise ValueError("min_new_tokens cannot exceed max_new_tokens")
-        if request.eos_token_id is not None and not _is_int(request.eos_token_id):
-            raise ValueError("eos_token_id must be an integer or None")
+        if request.eos_token_id is not None:
+            if not _is_int(request.eos_token_id):
+                raise ValueError("eos_token_id must be an integer or None")
+            if not 0 <= int(request.eos_token_id) < 31:
+                raise ValueError("eos_token_id must be within the tiny vocabulary")
         if (
             not isinstance(request.temperature, Real)
             or isinstance(request.temperature, bool)
             or not math.isfinite(float(request.temperature))
         ):
             raise ValueError("temperature must be finite")
+        if (
+            not isinstance(request.weight, Real)
+            or isinstance(request.weight, bool)
+            or not math.isfinite(float(request.weight))
+            or float(request.weight) < 0
+        ):
+            raise ValueError("weight must be a finite non-negative number")
         try:
             prompt = tuple(request.prompt)
         except TypeError:
@@ -202,11 +269,27 @@ class BatchEngine:
             _freeze(request.model),
             id(model),
             _freeze(request.adapter),
-            _freeze(request.temperature),
+            ("temperature", float(request.temperature)),
         )
 
     def _result_key(self, request):
-        return (self._context_key(request), _freeze(tuple(request.prompt)))
+        """Key cached raw generations by every output-affecting option.
+
+        EOS/minimum and stop policies can make two rows with the same prompt
+        produce different raw lengths.  Keeping those options in the key
+        prevents a row from inheriting a shorter continuation generated for a
+        different stopping policy.  ``request_id`` and ``weight`` remain
+        metadata and deliberately stay out of the key.
+        """
+
+        return (
+            self._context_key(request),
+            _freeze(tuple(request.prompt)),
+            int(request.max_new_tokens),
+            int(request.min_new_tokens),
+            None if request.eos_token_id is None else _freeze(request.eos_token_id),
+            _freeze(_stop_sequences(request)),
+        )
 
     def _prefix_key(self, context, prefix):
         return (context, _freeze(tuple(prefix)))
@@ -237,17 +320,80 @@ class BatchEngine:
 
     @staticmethod
     def _apply_stop(tokens, request):
-        """Apply max/min/EOS policy to a raw deterministic token sequence."""
+        """Apply max/min, EOS, and byte/token-level stop policies.
+
+        Stop markers are removed from the returned continuation, matching the
+        usual text-generation API. Integer/tuple markers use token boundaries.
+        String and bytes markers are matched against UTF-8 bytes and can span
+        token boundaries. A marker cannot terminate before ``min_new_tokens``.
+        """
 
         result = list(tokens[: request.max_new_tokens])
-        eos = request.eos_token_id
-        if eos is None:
-            return result
         minimum = min(request.min_new_tokens, request.max_new_tokens)
-        for index, token in enumerate(result):
-            if token == eos and index + 1 >= minimum:
-                return result[: index + 1]
-        return result
+        eos = request.eos_token_id
+        if eos is not None:
+            for index, token in enumerate(result):
+                if token == eos and index + 1 >= minimum:
+                    result = result[: index + 1]
+                    break
+
+        markers = _stop_sequences(request)
+        if not markers:
+            return result
+
+        token_markers: list[tuple[Any, ...]] = []
+        byte_markers: list[bytes] = []
+        for marker in markers:
+            if isinstance(marker, (str, bytes, bytearray, memoryview)):
+                encoded = _token_bytes(marker)
+                if encoded:
+                    byte_markers.append(encoded)
+                continue
+            if isinstance(marker, Integral):
+                token_markers.append((marker,))
+            else:
+                try:
+                    sequence = tuple(marker)
+                except TypeError:
+                    continue
+                if sequence:
+                    token_markers.append(sequence)
+
+        cut = len(result)
+        for marker in token_markers:
+            width = len(marker)
+            for end in range(max(minimum, width), len(result) + 1):
+                if tuple(result[end - width : end]) == marker:
+                    candidate = end - width
+                    # Removing a marker must never shorten the continuation
+                    # below min_new_tokens.  Keep scanning for a later marker.
+                    if candidate >= minimum:
+                        cut = min(cut, candidate)
+                        break
+
+        if byte_markers:
+            accumulated = bytearray()
+            starts: list[int] = []
+            for index, token in enumerate(result):
+                starts.append(len(accumulated))
+                accumulated.extend(_token_bytes(token))
+                if index + 1 < minimum:
+                    continue
+                matched = next((marker for marker in byte_markers if marker and accumulated.endswith(marker)), None)
+                if matched is None:
+                    continue
+                marker_start = len(accumulated) - len(matched)
+                marker_cut = index
+                for token_index, token_start in enumerate(starts):
+                    token_end = starts[token_index + 1] if token_index + 1 < len(starts) else len(accumulated)
+                    if token_start <= marker_start < token_end:
+                        marker_cut = token_index
+                        break
+                if marker_cut >= minimum:
+                    cut = min(cut, marker_cut)
+                    break
+
+        return result[:cut]
 
     def _cached_raw(self, request, required):
         cached = self.cache.get(self._result_key(request))
@@ -271,7 +417,10 @@ class BatchEngine:
         prompts = [tuple(request.prompt) for request in requests]
         if mode == "padded":
             width = max((len(prompt) for prompt in prompts), default=0)
-            self.stats["padded_tokens"] += sum(width - len(prompt) for prompt in prompts)
+            # Count the full rectangular work surface.  This includes real
+            # and padding positions and makes padded-vs-packed pressure
+            # comparisons explicit.
+            self.stats["padded_tokens"] += width * len(prompts)
         else:
             self.stats["packed_tokens"] += sum(len(prompt) for prompt in prompts)
         batch_method = getattr(model, "next_tokens_batch", None)
@@ -343,9 +492,13 @@ class BatchEngine:
                 if cached is not None:
                     outputs[index] = self._apply_stop(cached, request)
                     continue
-                prompt_key = _freeze(tuple(request.prompt))
+                # Generation controls are part of the pending key.  Rows
+                # sharing a prompt can still require different raw lengths or
+                # EOS behavior, so grouping by prompt alone would leak the
+                # first row's stopping policy into its siblings.
+                prompt_key = self._result_key(request)
                 current = pending_by_prompt.get(prompt_key)
-                if current is None or request.max_new_tokens > current[1]:
+                if current is None:
                     pending_by_prompt[prompt_key] = (request, request.max_new_tokens)
 
             pending = list(pending_by_prompt.values())
@@ -359,8 +512,8 @@ class BatchEngine:
                 for (request, _), raw in zip(pending, raw_values):
                     raw = list(raw)
                     self.cache.put(self._result_key(request), raw)
-                    prompt_key = _freeze(tuple(request.prompt))
+                    request_key = self._result_key(request)
                     for index, row_request in rows:
-                        if _freeze(tuple(row_request.prompt)) == prompt_key:
+                        if self._result_key(row_request) == request_key:
                             outputs[index] = self._apply_stop(raw, row_request)
         return outputs
