@@ -153,9 +153,11 @@ def _validate_prefix_hints(request: OracleRequest, prompt: Sequence[Any]) -> Non
 
 def _support_parts(row: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
     if isinstance(row, Mapping):
+        prompt = row.get("prompt", row.get("input", row.get("tokens", ())))
+        continuation = row.get("continuation", row.get("target", row.get("completion", row.get("output", ()))))
         return (
-            tuple(row.get("prompt", row.get("tokens", ()))),
-            tuple(row.get("continuation", row.get("target", row.get("completion", ())))),
+            tuple(prompt),
+            tuple(continuation),
         )
     return tuple(getattr(row, "prompt", ())), tuple(getattr(row, "continuation", ()))
 
@@ -258,7 +260,7 @@ def _validate_request(request: OracleRequest, vocab_size: int) -> None:
         _token_value(token)
     for row in request.support_rows:
         if isinstance(row, Mapping):
-            values = (row.get("prompt", row.get("tokens", ())), row.get("continuation", row.get("target", row.get("completion", ()))))
+            values = (row.get("prompt", row.get("input", row.get("tokens", ()))), row.get("continuation", row.get("target", row.get("completion", row.get("output", ())))))
         elif hasattr(row, "prompt") and hasattr(row, "continuation"):
             values = (row.prompt, row.continuation)
         else:

@@ -68,9 +68,9 @@ def _normalize_support_row(row: Any) -> SupportRow:
     if isinstance(row, SupportRow):
         return row
     if isinstance(row, Mapping):
-        prompt = row.get("prompt", row.get("tokens", ()))
-        continuation = row.get("continuation", row.get("target", row.get("completion", ())))
-        return SupportRow(prompt, continuation, row.get("weight", 1.0), row.get("request_id"))
+        prompt = row.get("prompt", row.get("input", row.get("tokens", ())))
+        continuation = row.get("continuation", row.get("target", row.get("completion", row.get("output", ()))))
+        return SupportRow(prompt, continuation, row.get("weight", 1.0), row.get("request_id", row.get("id")))
     if isinstance(row, (tuple, list)):
         if len(row) == 2 and isinstance(row[0], (tuple, list)):
             return SupportRow(row[0], row[1])

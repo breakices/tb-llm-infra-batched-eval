@@ -133,8 +133,8 @@ def _support_values(request: Any, support: Iterable[Any] | None) -> tuple[Any, .
 
 def _support_parts(row: Any) -> tuple[tuple[Any, ...], tuple[Any, ...], float]:
     if isinstance(row, Mapping):
-        prompt = row.get("prompt", row.get("tokens", ()))
-        continuation = row.get("continuation", row.get("target", row.get("completion", ())))
+        prompt = row.get("prompt", row.get("input", row.get("tokens", ())))
+        continuation = row.get("continuation", row.get("target", row.get("completion", row.get("output", ()))))
         weight = row.get("weight", 1.0)
     else:
         prompt = getattr(row, "prompt", ())
