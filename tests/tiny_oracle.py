@@ -1,82 +1,79 @@
-"""Dependency-free reference evaluator for the batched generation task.
+"""Verifier-owned scalar formula and an instrumented generation backend."""
 
-The oracle deliberately does not call a candidate model to compute the expected
-sequence.  It mirrors the small arithmetic contract documented by ``ToyModel``
-and applies EOS/minimum-length handling itself.  The evaluator is also used by
-the private tests to keep scoring independent from engine cache state.
-"""
-
-from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from llm_runtime import Request
 
 
-@dataclass(frozen=True)
-class EvalCase:
-    case_id: str
-    request: Any
-    expected: tuple
-    weight: float = 1.0
+def request(**fields):
+    values = {
+        "tenant": "t1",
+        "model": "m1",
+        "adapter": "base",
+        "prompt": (1, 2, 3),
+        "max_new_tokens": 4,
+        "temperature": 0.0,
+    }
+    values.update(fields)
+    return Request(**values)
 
 
-def oracle_tokens(
-    model_id: str,
-    adapter: str,
-    prompt: Sequence[int],
-    temperature: float,
-    max_new_tokens: int,
-    min_new_tokens: int = 0,
-    eos_token_id: Any = None,
-) -> tuple:
-    """Return the expected deterministic ToyModel continuation.
+def token_value(token):
+    if isinstance(token, int):
+        return int(token)
+    if isinstance(token, str):
+        units = map(ord, token)
+    else:
+        units = bytes(token)
+    return sum(index * unit for index, unit in enumerate(units, 1))
 
-    EOS is considered only after ``min_new_tokens`` have been emitted.  The
-    result never exceeds ``max_new_tokens`` and is immutable for safe reuse.
-    """
-    salt = sum(ord(char) for char in (model_id + adapter)) % 97
-    seed = (sum(prompt) + salt + int(temperature * 1000)) % 1000
-    raw = [((seed + index * 17) % 101) for index in range(max_new_tokens)]
-    if eos_token_id is None:
-        return tuple(raw)
-    result = []
-    minimum = max(0, min(int(min_new_tokens), int(max_new_tokens)))
-    for token in raw:
-        result.append(token)
-        if len(result) >= minimum and token == eos_token_id:
+
+def oracle_tokens(model_id, adapter, prompt, temperature, max_new_tokens,
+                  min_new_tokens=0, eos_token_id=None):
+    """Compute raw ToyModel tokens, stopping at the first eligible EOS."""
+    salt = sum(map(ord, str(model_id) + str(adapter))) % 97
+    seed = (sum(map(token_value, prompt)) + salt + int(temperature * 1000)) % 1000
+    tokens = []
+    for step in range(max_new_tokens):
+        token = (seed + 17 * step) % 101
+        tokens.append(token)
+        if token == eos_token_id and len(tokens) >= min_new_tokens:
             break
-    return tuple(result)
+    return tuple(tokens)
 
 
-def weighted_exact_match(
-    predictions: Mapping[str, Sequence[int]], cases: Iterable[EvalCase]
-) -> float:
-    """Compute a weighted exact-match score without normalizing by item count."""
-    numerator = 0.0
-    denominator = 0.0
-    for case in cases:
-        weight = float(case.weight)
-        if weight < 0:
-            raise ValueError("case weights must be non-negative")
-        denominator += weight
-        if tuple(predictions[case.case_id]) == tuple(case.expected):
-            numerator += weight
-    return numerator / denominator if denominator else 0.0
+def expected(row):
+    prompt = row.prompt
+    limit = getattr(row, "context_length", None)
+    if limit is not None:
+        prompt = prompt[-limit:] if limit else ()
+    tokens = oracle_tokens(
+        row.model, row.adapter, prompt, row.temperature, row.max_new_tokens,
+        getattr(row, "min_new_tokens", 0), getattr(row, "eos_token_id", None),
+    )
+    return list(tokens)
 
 
-class TinyEvaluator:
-    """Run both engine batch modes and return order-preserving predictions."""
+class RecordingModel:
+    """Record actual backend inputs so assertions don't rely on engine counters."""
 
-    MODES = ("padded", "packed")
+    def __init__(self, model_id="m1", revision=0):
+        self.model_id = model_id
+        self.revision = revision
+        self.calls = []
+        self.prefilled = []
 
-    def run(self, engine: Any, cases: Sequence[EvalCase], mode: str = "packed"):
-        if mode not in self.MODES:
-            raise ValueError("mode must be 'padded' or 'packed'")
-        requests = [case.request for case in cases]
-        outputs = engine.generate_batch(requests, mode=mode)
-        if len(outputs) != len(cases):
-            raise AssertionError("engine returned a different number of outputs")
-        return {case.case_id: tuple(output) for case, output in zip(cases, outputs)}
+    def _tokens(self, prompt, adapter, temperature, limit):
+        raw = oracle_tokens(self.model_id, adapter, prompt, temperature, limit)
+        return [(token + self.revision) % 101 for token in raw]
 
-    def score(self, engine: Any, cases: Sequence[EvalCase], mode: str = "packed"):
-        predictions = self.run(engine, cases, mode=mode)
-        return weighted_exact_match(predictions, cases)
+    def next_tokens(self, prompt, adapter, temperature, max_new_tokens):
+        self.calls.append(("scalar", [tuple(prompt)]))
+        return self._tokens(prompt, adapter, temperature, max_new_tokens)
 
+    def next_tokens_batch(self, prompts, adapter, temperature, max_new_tokens, mode="padded"):
+        prompts = [tuple(prompt) for prompt in prompts]
+        self.calls.append((mode, prompts))
+        return [self._tokens(prompt, adapter, temperature, max_new_tokens) for prompt in prompts]
+
+    def prefill(self, tokens, adapter, temperature):
+        self.prefilled.extend(tokens)
+        return tuple(tokens)

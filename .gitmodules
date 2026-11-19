@@ -1,0 +1,4 @@
+[submodule "lm-evaluation-harness"]
+	path = environment/upstream/lm-evaluation-harness
+	url = https://github.com/EleutherAI/lm-evaluation-harness.git
+	shallow = true

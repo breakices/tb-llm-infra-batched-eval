@@ -1,0 +1,164 @@
+diff --git a/llm_runtime.py b/llm_runtime.py
+--- a/llm_runtime.py
++++ b/llm_runtime.py
+@@ -6,6 +6,7 @@
+ import math
+ from numbers import Integral, Real
+ from typing import Any
++from uuid import uuid4
+ 
+ 
+ @dataclass(frozen=True)
+@@ -203,7 +204,7 @@
+         self.pad_token_id = pad_token_id
+         self.cache = KVCache()
+         self.prefix_cache = KVCache()
+-        self._generation = 0
++        self._generation = None
+         self.stats = {
+             "mode": mode,
+             "batch_calls": 0,
+@@ -214,15 +215,20 @@
+         }
+         self.last_batch_mode = mode
+ 
++    @property
++    def deployment_state(self):
++        """Only a declared initial deployment is shared across process restarts."""
++        return self._generation
++
+     def register(self, model):
+         self.models[model.model_id] = model
+         # A model object can retain different behavior under the same id.
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+     def clear(self):
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+@@ -270,7 +276,18 @@
+             raise ValueError("prompt values must be integer, text, or byte tokens")
+ 
+     def _context_key(self, request):
+-        return (self._generation, request.model, float(request.temperature))
++        model = self.models.get(request.model)
++        return (
++            self._generation,
++            _freeze(request.tenant),
++            _freeze(request.model),
++            id(model),
++            _freeze(request.adapter),
++            ("temperature", float(request.temperature)),
++            request.context_length,
++            request.seed,
++            request.shard,
++        )
+ 
+     @staticmethod
+     def _effective_prompt(request):
+@@ -308,10 +325,10 @@
+             return
+         context = self._context_key(request)
+         longest = 0
+-        for length in range(len(prompt), 0, -1):
+-            if self.prefix_cache.contains(self._prefix_key(context, prompt[:length])):
+-                longest = length
++        for length in range(1, len(prompt) + 1):
++            if not self.prefix_cache.contains(self._prefix_key(context, prompt[:length])):
+                 break
++            longest = length
+         if longest:
+             self.stats["prefix_hits"] += 1
+         if longest == len(prompt):
+diff --git a/lm_eval/api/model.py b/lm_eval/api/model.py
+--- a/lm_eval/api/model.py
++++ b/lm_eval/api/model.py
+@@ -221,6 +221,10 @@
+         by default (no chat template).
+         """
+         return ""
++
++    def response_cache_key(self, attr: str, args: Iterable[Any]) -> str:
++        """Persistent response identity; legacy providers retain their on-disk keys."""
++        return hash_args(attr, args)
+ 
+     def set_cache_hook(self, cache_hook: "CacheHook") -> None:
+         self.cache_hook = cache_hook
+@@ -264,11 +268,12 @@
+             return
+ 
+         self.dbdict = cachinglm.dbdict
++        self._response_key = cachinglm.lm.response_cache_key
+ 
+     def add_partial(self, attr: str, req: Iterable[Any], res: Any) -> None:
+         if self.dbdict is None:
+             return
+-        hsh = hash_args(attr, req)
++        hsh = self._response_key(attr, req)
+         self.dbdict[hsh] = res
+ 
+ 
+@@ -306,7 +311,7 @@
+                 f"Loading '{attr}' responses from cache '{self.cache_db}' where possible..."
+             )
+             for req in tqdm(requests, desc="Checking cached requests"):
+-                hsh = hash_args(attr, req.args)
++                hsh = self.lm.response_cache_key(attr, req.args)
+                 if attr == "generate_until" and req.args[1].get("do_sample", False):
+                     # when we are doing non-greedy generation, don't use the cache
+                     # (else every "randomly sampled" generation would be identical for repeats > 1).
+@@ -341,7 +346,7 @@
+                 res[resptr] = r
+ 
+                 # caching
+-                hsh = hash_args(attr, req.args)
++                hsh = self.lm.response_cache_key(attr, req.args)
+                 self.dbdict[hsh] = r
+             self.dbdict.commit()
+ 
+diff --git a/lm_eval/models/codesense_batch.py b/lm_eval/models/codesense_batch.py
+--- a/lm_eval/models/codesense_batch.py
++++ b/lm_eval/models/codesense_batch.py
+@@ -7,7 +7,6 @@
+ 
+ from lm_eval.api.model import LM
+ from lm_eval.api.registry import register_model
+-from lm_eval.models.utils import Collator
+ 
+ from llm_runtime import BatchEngine, Request, ToyModel
+ 
+@@ -31,6 +30,15 @@
+         if self.replay_batch_size < 1:
+             raise ValueError("batch_size must be positive")
+         self.engine = BatchEngine(models={model: ToyModel(model)}) if engine is None else engine
++
++    def response_cache_key(self, attr, args):
++        # A saved result is reusable across restarts and compatible layouts
++        # within an unchanged serving deployment.
++        from lm_eval.api.model import hash_args
++
++        scope = ["codesense-batch-v1", self.model_name, self.tenant, self.adapter,
++                 self.revision, self.engine.deployment_state]
++        return "codesense:" + hash_args(attr, [scope, *args])
+ 
+     def generate_until(self, requests, disable_tqdm=False):
+         """Replay native (context, generation kwargs) pairs in scheduled batches."""
+@@ -62,9 +70,11 @@
+             )
+             rows.append((request, tuple(stops), instance.args))
+ 
+-        batches = Collator(rows, sort_fn=lambda row: -len(row[0].prompt))
++        # Keep the bounded chunks in original request order.
++        chunks = (rows[start:start + self.replay_batch_size]
++                  for start in range(0, len(rows), self.replay_batch_size))
+         outputs = []
+-        for batch in batches.get_batched(n=self.replay_batch_size):
++        for batch in chunks:
+             raw = self.engine.generate_batch([row for row, _, _ in batch], mode=self.mode)
+             for tokens, (_, stops, args) in zip(raw, batch, strict=True):
+                 text = "".join(_ALPHABET[token % len(_ALPHABET)] for token in tokens)

@@ -1,0 +1,698 @@
+schema_version = "1.4"
+artifacts = ["/logs/verifier/result.json", "/logs/verifier/reward.txt"]
+
+[task]
+name = "codesense/cs-xx-003"
+version = "4.0.0"
+description = "维护 Language Model Evaluation Harness 中的离线生成后端。"
+
+[[task.authors]]
+name = "XX"
+
+[agent]
+timeout_sec = 2700
+user = "dev"
+
+[verifier]
+timeout_sec = 600
+user = "root"
+
+[environment]
+build_timeout_sec = 1800
+cpus = 2
+memory_mb = 4096
+workdir = "/workspace"
+
+[metadata]
+id = "CS-XX-003"
+title = "离线生成评测的批处理修复"
+platform = "linux/amd64"
+objective = "让进程内调度、公开模型接口与跨进程响应重放一致，并在相容请求上减少实际后端工作。"
+focus_points = ["②隐蔽缺陷定位与归因", "④语言/运行时语义边界", "⑥约束理解与tradeoff判断"]
+trap_type = "输出文本相同不等于请求身份、生命周期或行位置相同。进程内预填充、批次调度和 SQLite 部分写入均受影响。"
+badpattern = "改一查十"
+turns_count = 1
+has_embedded_challenge = true
+challenge_premise_is_false = true
+expert_minutes = 120
+code_origin = "opensource"
+code_license = "MIT AND Apache-2.0"
+source_note = "EleutherAI/lm-evaluation-harness v0.4.13，提交 ddd67220430a2470529f25fd5c05a576ca1057a0。上游项目实际承担模型注册、请求排序、响应缓存与评测；本题新增的 CPU 回放后端和起始缺陷属于派生任务。上游清单和许可范围见包外材料 07。"
+version = "4.0.0"
+author = "XX"
+# BEGIN embedded solver instruction
+prompt = '''
+# 离线生成评测的批处理修复
+
+团队在 Language Model Evaluation Harness 里用 `codesense-batch` 后端回放生成请求。它在 CPU 上运行，供上线前比较调度器与单条模型调用的行为。值班记录里还有一种情况：磁盘缓存已经预热，换实验配置并重启进程后仍出现之前的文本。切换批布局或复用同一个后端进程后，偶尔有请求拿到另一行的续写。带重复数据的评测还发起了过多模型调用。
+
+请修改 `repo/`。使用 harness 登记的模型名调用 `generate_until`，以及直接使用已有 Python 批处理接口时，两者都要符合随仓库提供的后端协议（`docs/model_guide/codesense-batch.md`）。逐条、无缓存的模型调用是续写的数值依据。继续兼容已有请求构造方式、调用接口和结果类型；结果按输入顺序对应，请求标记和指标权重只是评测记录。调用者可以修改自己得到的结果，输入对象和后续请求仍应按原始内容执行。
+
+线上按租户分别核算模型工作，模型替换或清理后要使用当前模型状态。开启 harness 的持久缓存后，同样的生成约定在进程重启、配置切换和部分命中时继续成立，已有其他模型后端的缓存文件仍须可读。两种批布局的计数应反映实际输入量。对支持批调用的模型，一个冷批次应至少达到每组兼容且互异的非空请求每八条一次调用的预算，尾部不足八条可使用一次调用。完整重放相同工作负载时应复用之前的结果。应在本机 CPU 上验证，不需要下载权重或调用模型服务。
+
+同事提议把每个输入的文本作为唯一标识，复用第一次出现时的生成结果，最后按本次请求的长度截短。请判断这份方案能否满足上述要求，直接交付代码。
+
+镜像预装了本题所用的 registry、Instance 和 SQLite 组件。可以在 `/workspace/repo` 下用真实模型接口运行一条请求：
+
+```sh
+python - <<'PY'
+from lm_eval.api.instance import Instance
+from lm_eval.api.registry import get_model
+
+row = Instance("generate_until", {"text": "hello"}, ("hello", {"max_gen_toks": 3}), 0)
+model = get_model("codesense-batch")(model="m1", mode="packed")
+print(model.generate_until([row]))
+PY
+```
+
+这次整改仅涉及 CPU 确定性生成；其他评测任务、训练权重、远端服务和第三方 GPU 后端不在验收范围内。
+'''
+# END embedded solver instruction
+
+[metadata.embedded_challenge]
+location = "instruction.md 末段同事建议"
+content = "将文本作为唯一标识并按本次长度截短缓存结果。"
+criterion = "必须以完整业务上下文、调用顺序和部署状态验证该建议。"
+
+[metadata.ground_truth]
+reference_answer = "solution/golden/answer.md"
+reference_patch = "solution/golden/golden.patch"
+change_points = "solution/golden/change_points.yaml"
+change_point_ids = ["CP3", "CP4", "CP6"]
+regression_points = ["CP1", "CP2", "CP5"]
+equivalent_impls = ["solution/variants/variant_a.patch", "solution/variants/variant_b.patch", "tests/calibration/equivalent.patch"]
+counterexamples = ["solution/counterexamples/cache_observations.py"]
+
+[metadata.expert_design_notes]
+intent = "参照独立标量输出验证批量调度与模型适配层，用实际模型调用确认正确实现既能复用又遵循工作边界。"
+trap_design = "模板事件、重复请求、进程内模型代际与 SQLite 部分写入的作用域不同，只修一条缓存读路径无法保护其他消费者。"
+boundary = "CPU 的确定性生成接口是题目范围。支持任意等价的数据结构；实际 GPU 吞吐、模型权重下载以及无关的任务数据集均不计分。"
+challenge_discrimination = "重复文本在同一工作环境内经常可重用；部署身份、行顺序、早停和中断点变化时需要核对是否仍属于同一份响应。"
+
+[[metadata.model_failure_modes]]
+id = "FM1"
+description = "批转发合并不同租户的相同 prompt，导致独立工作被相互复用。"
+unit_tests = ["U23", "U24"]
+evidence = "tests/assets/history-v3.md#development-evidence-from-earlier-tasks"
+evidence_version = "3.x 开发试答"
+collected_on = "2026-11-18"
+model = "claude-opus-5-5"
+
+[[metadata.model_failure_modes]]
+id = "FM2"
+description = "把前缀和序列条目都计作公开结果条目，改变 KVCache 的可观察行为。"
+unit_tests = ["U6", "U25"]
+evidence = "tests/assets/history-v3.md#development-evidence-from-earlier-tasks"
+evidence_version = "3.x 开发试答"
+collected_on = "2026-11-18"
+model = "claude-opus-5-5"
+
+[[metadata.model_failure_modes]]
+id = "FM3"
+description = "将配置字段的整数校验复用于 prompt，布尔 token 在批次中被拒绝。"
+unit_tests = ["U25"]
+evidence = "tests/assets/history-v3.md#development-evidence-from-earlier-tasks"
+evidence_version = "3.x 开发试答"
+collected_on = "2026-11-18"
+model = "claude-opus-5-5"
+
+# BEGIN verifier index
+[metadata.unit_tests]
+count = 47
+targets_badpattern_count = 4
+"回归安全" = ["test_positional_request_generation", "test_clear_discards_warm_state", "test_kv_cache_detaches_lists_on_write_and_read", "test_prompt_lists_survive_padding_and_cache_hits", "test_scalar_only_backend_receives_the_effective_prompt", "test_harness_legacy_response_keys_remain_readable"]
+"语义正确性" = ["test_toy_model_token_formula", "test_cold_layouts_match_scalar_oracle", "test_compatible_rows_use_one_batched_forward", "test_eos_included_at_first_eligible_position", "test_effective_context_is_right_truncated", "test_unicode_and_bytes_prompts_match_the_uncached_backend", "test_utf8_stop_markers_span_output_tokens", "test_packed_cold_192", "test_padded_cold_192", "test_harness_registry_renders_instances_in_order", "test_harness_stops_at_first_text_match"]
+"改一查十完备性" = ["test_register_replacement_invalidates_old_cache", "test_kv_cache_preserves_distinct_typed_keys", "test_internal_grouping_restores_request_order", "test_duplicate_ids_and_rows_preserve_all_positions", "test_returned_duplicate_rows_and_cache_are_detached", "test_duplicate_semantics_submit_one_backend_row", "test_request_metadata_and_layout_reuse_sequence", "test_model_context_uses_its_own_backend", "test_adapter_context_uses_its_own_state", "test_temperature_context_uses_its_own_state", "test_continuation_length_isolated_on_warm_cache", "test_padded_work_counts_every_submitted_row", "test_packed_work_counts_each_real_effective_token_once", "test_rollout_seed_and_shard_isolate_sequence_state", "test_replay_work_budget_192", "test_harness_response_cache_reopens_and_scatters_hits", "test_harness_response_cache_isolates_serving_scopes", "test_harness_partial_checkpoint_uses_response_cache_scope"]
+"边界与异常" = ["test_unknown_model_rejected_before_batch_work", "test_invalid_generation_limit_rejected_before_batch_work", "test_invalid_temperature_rejected_before_batch_work", "test_invalid_eos_rejected_before_batch_work", "test_invalid_mode_rejected_before_batch_work", "test_zero_length_request_does_no_model_work", "test_empty_batch_has_no_model_work", "test_early_eos_kept_and_ignored_until_minimum", "test_stop_marker_before_minimum_is_retained"]
+"单轮反幻觉" = ["test_tenant_sequence_cache_isolated_by_value_and_type", "test_different_tenants_have_independent_cold_prefix_work", "test_identical_prompts_with_distinct_types_keep_their_own_state"]
+
+[metadata.verification]
+human_required = false
+test_is_sufficient = true
+judge_type = "unit_test"
+scoring_scripts = ["tests/test.sh", "tests/score.py"]
+ut_count = 47
+
+[[metadata.ut_index]]
+id = "U1"
+ut_name = "test_positional_request_generation"
+turn = "turn1"
+dimension = "回归安全"
+description = "Generating from a six-field positional request preserves the scalar model's token sequence."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Compare the six-field request's complete token list with a separately computed scalar continuation."
+
+[[metadata.ut_index]]
+id = "U2"
+ut_name = "test_toy_model_token_formula"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Integer, boolean, Unicode and byte prompts produce the documented scalar token values."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Compare next_tokens for mixed numeric, text and byte prompts with independently calculated tokens."
+
+[[metadata.ut_index]]
+id = "U3"
+ut_name = "test_register_replacement_invalidates_old_cache"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Replacing a model under the same id recomputes its prefix and returns the new model's output."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Assert changed tokens from a replacement model and inspect that model's measured prefill and generation calls."
+
+[[metadata.ut_index]]
+id = "U4"
+ut_name = "test_clear_discards_warm_state"
+turn = "turn1"
+dimension = "回归安全"
+description = "After two clears, the next identical request performs a fresh prefill and forward."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "After warming and clearing twice, inspect the next generation's tokens, prefill input and model calls."
+
+[[metadata.ut_index]]
+id = "U5"
+ut_name = "test_kv_cache_detaches_lists_on_write_and_read"
+turn = "turn1"
+dimension = "回归安全"
+description = "Mutating a submitted or retrieved list leaves the stored token list intact."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Mutate the original and then retrieved list; read the stored list after each mutation."
+
+[[metadata.ut_index]]
+id = "U6"
+ut_name = "test_kv_cache_preserves_distinct_typed_keys"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Equal-valued int and bool keys store distinct entries, survive overwrites, and all clear."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = true
+change_points = "CP3"
+evidence_required = "Inspect len(cache) and values after writes to bool/int lookalikes, an overwrite and a clear."
+
+[[metadata.ut_index]]
+id = "U7"
+ut_name = "test_unknown_model_rejected_before_batch_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "A later unknown model raises KeyError before any earlier row reaches the backend."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Assert KeyError for a later unknown model and zero prefill and forward calls on the valid first row."
+
+[[metadata.ut_index]]
+id = "U8"
+ut_name = "test_invalid_generation_limit_rejected_before_batch_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "Reject invalid integer token budgets and impossible minimums before backend work."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Check the error type and zero measured work for negative, boolean, fractional and impossible budgets."
+
+[[metadata.ut_index]]
+id = "U9"
+ut_name = "test_invalid_temperature_rejected_before_batch_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "Reject boolean, string and nonfinite temperatures for the entire batch before any work."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Inspect the exception and backend history for nonfinite, string and boolean temperatures."
+
+[[metadata.ut_index]]
+id = "U10"
+ut_name = "test_invalid_eos_rejected_before_batch_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "Reject invalid EOS id types and ids outside the vocabulary before any backend work."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Check each unsupported EOS id and assert that no backend was called."
+
+[[metadata.ut_index]]
+id = "U11"
+ut_name = "test_invalid_mode_rejected_before_batch_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "An unsupported layout fails without a prefill or generation call."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Pass an unsupported layout; check the rejection and the absence of model calls."
+
+[[metadata.ut_index]]
+id = "U12"
+ut_name = "test_cold_layouts_match_scalar_oracle"
+turn = "turn1"
+dimension = "语义正确性"
+description = "A cold padded or packed ragged batch yields exactly the scalar continuation for each row."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Compare per-row tokens from separate cold engines against independent expectations including empty prompts and real zeros."
+
+[[metadata.ut_index]]
+id = "U13"
+ut_name = "test_internal_grouping_restores_request_order"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Mixing models, changing order and replaying cached rows preserve their output positions."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Inspect per-row continuation positions for a mixed-model batch, its permutation and a warm replay."
+
+[[metadata.ut_index]]
+id = "U14"
+ut_name = "test_duplicate_ids_and_rows_preserve_all_positions"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Rows with equal request ids and repeated input rows all appear at their original positions."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Compare ordered outputs and row count for repeated request ids with both distinct and duplicate contents."
+
+[[metadata.ut_index]]
+id = "U15"
+ut_name = "test_returned_duplicate_rows_and_cache_are_detached"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Mutating either returned duplicate list cannot change the other row or a later cache hit."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Mutate both returned rows from a duplicate batch; compare sibling and later cache hit to the original continuation."
+
+[[metadata.ut_index]]
+id = "U16"
+ut_name = "test_prompt_lists_survive_padding_and_cache_hits"
+turn = "turn1"
+dimension = "回归安全"
+description = "Mutable prompt lists keep their submitted tokens across cold batches and repeated hits."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Verify the mutable input lists after padded and packed cold/warm runs, including a real trailing zero."
+
+[[metadata.ut_index]]
+id = "U17"
+ut_name = "test_compatible_rows_use_one_batched_forward"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Two compatible, distinct prompts reach the backend together, each exactly once."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Record the actual backend dispatch count and its prompt rows for compatible distinct requests."
+
+[[metadata.ut_index]]
+id = "U18"
+ut_name = "test_duplicate_semantics_submit_one_backend_row"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Repeating an identical request three times produces three answers from one backend row."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2+CP3"
+evidence_required = "Count actual submitted model rows and compare three scattered duplicate outputs against the scalar oracle."
+
+[[metadata.ut_index]]
+id = "U19"
+ut_name = "test_request_metadata_and_layout_reuse_sequence"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Changing row id, weight and output layout leaves an already-generated sequence reusable."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Warm one request; change id, weight and layout, then check unchanged tokens and zero new model calls."
+
+[[metadata.ut_index]]
+id = "U20"
+ut_name = "test_model_context_uses_its_own_backend"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Requests for the same prompt under different model ids both reach their configured model."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Compare outputs and inspect the backend calls for two logical models receiving the same prompt."
+
+[[metadata.ut_index]]
+id = "U21"
+ut_name = "test_adapter_context_uses_its_own_state"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Changing adapters requires fresh work while later repeats hit their own cached sequences."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Change the adapter, verify a cold forward, then replay both requests and require warm hits."
+
+[[metadata.ut_index]]
+id = "U22"
+ut_name = "test_temperature_context_uses_its_own_state"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Changing temperature requires fresh work while later repeats hit their own cached sequences."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Change the decoding temperature, verify a cold forward, then require hits for both temperatures."
+
+[[metadata.ut_index]]
+id = "U23"
+ut_name = "test_tenant_sequence_cache_isolated_by_value_and_type"
+turn = "turn1"
+dimension = "单轮反幻觉"
+description = "Both tenant value and tenant type distinguish cold requests and subsequent warm hits."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = true
+change_points = "CP3"
+evidence_required = "Observe two cold executions and later warm hits for distinct tenant strings and for integer/boolean tenant identities."
+
+[[metadata.ut_index]]
+id = "U24"
+ut_name = "test_different_tenants_have_independent_cold_prefix_work"
+turn = "turn1"
+dimension = "单轮反幻觉"
+description = "Only requests from the original tenant may reuse an already-prefilled common prefix."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = true
+change_points = "CP3"
+evidence_required = "Compare backend prefill work on identical prefixes across tenants and a partial prefix within the original tenant."
+
+[[metadata.ut_index]]
+id = "U25"
+ut_name = "test_identical_prompts_with_distinct_types_keep_their_own_state"
+turn = "turn1"
+dimension = "单轮反幻觉"
+description = "Prompt tokens equal in Python arithmetic still get separate cold state for bool and int."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = true
+change_points = "CP3"
+evidence_required = "Submit bool/int lookalike prompts sequentially and observe a cold backend call per type followed by warm hits."
+
+[[metadata.ut_index]]
+id = "U26"
+ut_name = "test_continuation_length_isolated_on_warm_cache"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Alternating long and short requests cannot truncate long outputs or extend short ones."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Compare short and long outputs against oracle in both insertion orders to detect stale truncation."
+
+[[metadata.ut_index]]
+id = "U27"
+ut_name = "test_zero_length_request_does_no_model_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "A zero-length request returns an empty continuation with no prefill or generation."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Assert empty output and inspect both generation and prefill counts for zero tokens."
+
+[[metadata.ut_index]]
+id = "U28"
+ut_name = "test_empty_batch_has_no_model_work"
+turn = "turn1"
+dimension = "边界与异常"
+description = "Empty batches in both layouts return no rows and never touch the model."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2"
+evidence_required = "Check empty result lists and zero measured backend work for both layouts."
+
+[[metadata.ut_index]]
+id = "U29"
+ut_name = "test_eos_included_at_first_eligible_position"
+turn = "turn1"
+dimension = "语义正确性"
+description = "An eligible EOS is included once; disabling EOS returns the independent full sequence."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Assert the exact short continuation containing eligible EOS and the full unstopped result."
+
+[[metadata.ut_index]]
+id = "U30"
+ut_name = "test_early_eos_kept_and_ignored_until_minimum"
+turn = "turn1"
+dimension = "边界与异常"
+description = "An EOS before the minimum remains in the output and does not prematurely stop generation."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Assert the exact full continuation when EOS occurred before the minimum length."
+
+[[metadata.ut_index]]
+id = "U31"
+ut_name = "test_padded_work_counts_every_submitted_row"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Padded statistics include duplicates and warm hits using the full rectangular input size."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP5"
+evidence_required = "Check cumulative rectangular input work for two calls including duplicates and cache hits, and unchanged packed count."
+
+[[metadata.ut_index]]
+id = "U32"
+ut_name = "test_packed_work_counts_each_real_effective_token_once"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Packed statistics count all submitted effective prompt tokens, including duplicates and hits."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP5"
+evidence_required = "Compare cumulative real-token count after right truncation, duplicates and replay, and unchanged padded count."
+
+[[metadata.ut_index]]
+id = "U33"
+ut_name = "test_effective_context_is_right_truncated"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Context lengths zero through beyond the prompt yield the correctly truncated scalar output."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Compare tokens for limits zero, one, two, beyond prompt, and unlimited in both layouts."
+
+[[metadata.ut_index]]
+id = "U34"
+ut_name = "test_unicode_and_bytes_prompts_match_the_uncached_backend"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Both layouts preserve non-ASCII and bytes-like tokens through batch dispatch and warm cache reads."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1+CP2"
+evidence_required = "Compare text and raw byte inputs with independent uncached arithmetic in both layouts."
+
+[[metadata.ut_index]]
+id = "U35"
+ut_name = "test_scalar_only_backend_receives_the_effective_prompt"
+turn = "turn1"
+dimension = "回归安全"
+description = "A backend with only a scalar method sees the same right-truncated inputs as a batch backend."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1+CP2"
+evidence_required = "Record the truncated input delivered to a scalar-only backend and compare its resulting tokens."
+
+[[metadata.ut_index]]
+id = "U36"
+ut_name = "test_rollout_seed_and_shard_isolate_sequence_state"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Changing either rollout seed or shard creates a cold context without disturbing warm entries."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP3"
+evidence_required = "Inspect cold work for independent rollout seeds and shards, followed by hits within those namespaces."
+
+[[metadata.ut_index]]
+id = "U37"
+ut_name = "test_utf8_stop_markers_span_output_tokens"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Both text and byte markers terminate at the start of a UTF-8 sequence spanning three tokens."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Compare output tokens retained before a UTF-8 delimiter crossing token boundaries."
+
+[[metadata.ut_index]]
+id = "U38"
+ut_name = "test_stop_marker_before_minimum_is_retained"
+turn = "turn1"
+dimension = "边界与异常"
+description = "A marker that would shorten the result below the minimum is emitted; the next eligible match stops."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP1"
+evidence_required = "Check tokens retained from an early delimiter and trim only the later eligible marker."
+
+[[metadata.ut_index]]
+id = "U39"
+ut_name = "test_packed_cold_192"
+turn = "turn1"
+dimension = "语义正确性"
+description = "A cold packed batch returns every row in order with the independently expected continuation."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2+CP3"
+evidence_required = "Compare the observed packed batch output at each seeded row to an independently evaluated scalar reference."
+
+[[metadata.ut_index]]
+id = "U40"
+ut_name = "test_padded_cold_192"
+turn = "turn1"
+dimension = "语义正确性"
+description = "A cold padded batch returns every row in order with the independently expected continuation."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2+CP3"
+evidence_required = "Compare the observed padded batch output at each seeded row to an independently evaluated scalar reference."
+
+[[metadata.ut_index]]
+id = "U41"
+ut_name = "test_replay_work_budget_192"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "A 192-row cold shard stays within the model-work budget; replay preserves answers with zero additional work."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP2+CP3"
+evidence_required = "Compare cold generation rows and prefilled tokens by model/adapter/temperature to typed per-tenant scopes, bound actual dispatches, and verify zero new work on reordered cross-layout replay."
+
+[[metadata.ut_index]]
+id = "U42"
+ut_name = "test_harness_registry_renders_instances_in_order"
+turn = "turn1"
+dimension = "语义正确性"
+description = "A registered backend accepts native Instance rows and returns UTF-8-based text in row order."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP4"
+evidence_required = "Resolve the native registry entry, instantiate through the upstream factory, and compare returned strings in both layouts to independently rendered UTF-8 tokens."
+
+[[metadata.ut_index]]
+id = "U43"
+ut_name = "test_harness_stops_at_first_text_match"
+turn = "turn1"
+dimension = "语义正确性"
+description = "Stop at the first textual occurrence, excluding the marker for scalar and list forms."
+criterion_necessity = "Explicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP4"
+evidence_required = "Give native Instance rows competing scalar/list stop strings and compare the rendered prefix ending before the earliest match."
+
+[[metadata.ut_index]]
+id = "U44"
+ut_name = "test_harness_response_cache_reopens_and_scatters_hits"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "New Python processes with different hash seeds share only persisted hits in input order."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP6"
+evidence_required = "Reopen SQLite in two fresh Python processes with different hash seeds; observe output order and the actual cold prompt sent to the second backend."
+
+[[metadata.ut_index]]
+id = "U45"
+ut_name = "test_harness_response_cache_isolates_serving_scopes"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "Tenant, model, adapter, revision and independently replaced model lifetimes isolate saved text."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP6"
+evidence_required = "Reopen a shared SQLite file across configuration scopes, then replace models in separate engine lifetimes at the same registration generation; verify each actual continuation and warm hit."
+
+[[metadata.ut_index]]
+id = "U46"
+ut_name = "test_harness_partial_checkpoint_uses_response_cache_scope"
+turn = "turn1"
+dimension = "改一查十完备性"
+description = "An interrupted batch checkpoint survives reopening and is visible only to its writer's scope."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP6"
+evidence_required = "Persist through upstream CacheHook, observe independent work under another tenant and a disk-only hit for the writer."
+
+[[metadata.ut_index]]
+id = "U47"
+ut_name = "test_harness_legacy_response_keys_remain_readable"
+turn = "turn1"
+dimension = "回归安全"
+description = "An unscoped upstream provider can reuse a SQLite response written by the previous release."
+criterion_necessity = "Implicit"
+judge_type = "unit_test"
+targets_badpattern = false
+change_points = "CP6"
+evidence_required = "Read a pre-populated unscoped v0.4.13 disk key from the native CachingLM with the standard dummy provider."

@@ -1,0 +1,154 @@
+diff --git a/llm_runtime.py b/llm_runtime.py
+--- a/llm_runtime.py
++++ b/llm_runtime.py
+@@ -6,6 +6,7 @@
+ import math
+ from numbers import Integral, Real
+ from typing import Any
++from uuid import uuid4
+ 
+ 
+ @dataclass(frozen=True)
+@@ -54,6 +55,8 @@
+         hash(value)
+     except TypeError:
+         return (type(value).__module__, type(value).__qualname__, repr(value))
++    if isinstance(value, bool):
++        value = int(value)
+     return (type(value).__module__, type(value).__qualname__, value)
+ 
+ 
+@@ -170,12 +173,7 @@
+         self._entries = {}
+ 
+     def get(self, prompt):
+-        value = self._entries.get(_freeze(prompt))
+-        if value is None:
+-            return None
+-        if isinstance(value, list):
+-            return list(value)
+-        return value
++        return self._entries.get(_freeze(prompt))
+ 
+     def put(self, prompt, value):
+         if isinstance(value, list):
+@@ -203,7 +201,7 @@
+         self.pad_token_id = pad_token_id
+         self.cache = KVCache()
+         self.prefix_cache = KVCache()
+-        self._generation = 0
++        self._generation = None
+         self.stats = {
+             "mode": mode,
+             "batch_calls": 0,
+@@ -214,15 +212,20 @@
+         }
+         self.last_batch_mode = mode
+ 
++    @property
++    def deployment_state(self):
++        """Only a declared initial deployment is shared across process restarts."""
++        return self._generation
++
+     def register(self, model):
+         self.models[model.model_id] = model
+         # A model object can retain different behavior under the same id.
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+     def clear(self):
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+@@ -270,7 +273,18 @@
+             raise ValueError("prompt values must be integer, text, or byte tokens")
+ 
+     def _context_key(self, request):
+-        return (self._generation, request.model, float(request.temperature))
++        model = self.models.get(request.model)
++        return (
++            self._generation,
++            _freeze(request.tenant),
++            _freeze(request.model),
++            id(model),
++            _freeze(request.adapter),
++            ("temperature", float(request.temperature)),
++            request.context_length,
++            request.seed,
++            request.shard,
++        )
+ 
+     @staticmethod
+     def _effective_prompt(request):
+diff --git a/lm_eval/api/model.py b/lm_eval/api/model.py
+--- a/lm_eval/api/model.py
++++ b/lm_eval/api/model.py
+@@ -221,6 +221,10 @@
+         by default (no chat template).
+         """
+         return ""
++
++    def response_cache_key(self, attr: str, args: Iterable[Any]) -> str:
++        """Persistent response identity; legacy providers retain their on-disk keys."""
++        return hash_args(attr, args)
+ 
+     def set_cache_hook(self, cache_hook: "CacheHook") -> None:
+         self.cache_hook = cache_hook
+@@ -264,6 +268,7 @@
+             return
+ 
+         self.dbdict = cachinglm.dbdict
++        self._response_key = cachinglm.lm.response_cache_key
+ 
+     def add_partial(self, attr: str, req: Iterable[Any], res: Any) -> None:
+         if self.dbdict is None:
+@@ -306,7 +311,7 @@
+                 f"Loading '{attr}' responses from cache '{self.cache_db}' where possible..."
+             )
+             for req in tqdm(requests, desc="Checking cached requests"):
+-                hsh = hash_args(attr, req.args)
++                hsh = self.lm.response_cache_key(attr, req.args)
+                 if attr == "generate_until" and req.args[1].get("do_sample", False):
+                     # when we are doing non-greedy generation, don't use the cache
+                     # (else every "randomly sampled" generation would be identical for repeats > 1).
+@@ -341,7 +346,7 @@
+                 res[resptr] = r
+ 
+                 # caching
+-                hsh = hash_args(attr, req.args)
++                hsh = self.lm.response_cache_key(attr, req.args)
+                 self.dbdict[hsh] = r
+             self.dbdict.commit()
+ 
+diff --git a/lm_eval/models/codesense_batch.py b/lm_eval/models/codesense_batch.py
+--- a/lm_eval/models/codesense_batch.py
++++ b/lm_eval/models/codesense_batch.py
+@@ -31,6 +31,15 @@
+         if self.replay_batch_size < 1:
+             raise ValueError("batch_size must be positive")
+         self.engine = BatchEngine(models={model: ToyModel(model)}) if engine is None else engine
++
++    def response_cache_key(self, attr, args):
++        # A saved result is reusable across restarts and compatible layouts
++        # within an unchanged serving deployment.
++        from lm_eval.api.model import hash_args
++
++        scope = ["codesense-batch-v1", self.model_name, self.tenant, self.adapter,
++                 self.revision, self.engine.deployment_state]
++        return "codesense:" + hash_args(attr, [scope, *args])
+ 
+     def generate_until(self, requests, disable_tqdm=False):
+         """Replay native (context, generation kwargs) pairs in scheduled batches."""
+@@ -72,7 +81,7 @@
+                 reply = text[:min(matches)] if matches else text
+                 self.cache_hook.add_partial("generate_until", args, reply)
+                 outputs.append(reply)
+-        return outputs
++        return batches.get_original(outputs)
+ 
+     def loglikelihood(self, requests, disable_tqdm=False):
+         raise NotImplementedError("this replay backend only supports generate_until")

@@ -1,0 +1,10 @@
+**
+!requirements.lock
+!workspace/
+!workspace/repo/
+!workspace/repo/**
+**/.git
+**/.git/**
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/

@@ -1,0 +1,50 @@
+task: CS-XX-003
+reference_patch: solution/golden/golden.patch
+# One-based anchors in the prepared upstream checkout after applying the reference patch.
+# IDs describe behavioral obligations. Only entries marked required are defects
+# that a solver must repair; regressions may be preserved without any edits.
+change_points:
+  - id: CP1
+    required: false
+    file: llm_runtime.py
+    symbol: Request / BatchEngine.generate
+    lines: [13, 236, 446]
+    behavior: Preserve public request semantics, validation, scalar continuations and output stops.
+    evidence: U1-U2, U7-U11, U27, U29-U30, U33-U35, U37-U38
+  - id: CP2
+    required: false
+    file: llm_runtime.py
+    symbol: BatchEngine.generate_batch
+    lines: [449]
+    behavior: Preserve row positions and independent-generation parity across layouts, duplicates and reordered replay; batch compatible backend work.
+    evidence: U12-U14, U16-U18, U28, U34-U35, U39-U41
+  - id: CP3
+    required: true
+    file: llm_runtime.py
+    symbol: BatchEngine._context_key / BatchEngine.generate_batch
+    lines: [219, 223, 230, 278, 449]
+    behavior: Bind sequence work, prefix state and batch dispatch to the serving context; preserve ownership through clearing and replacement.
+    evidence: U3-U6, U15, U18-U26, U36, U39-U41
+  - id: CP4
+    required: true
+    file: lm_eval/models/codesense_batch.py
+    symbol: CodesenseBatchLM.generate_until
+    lines: [44, 84]
+    behavior: Restore harness request order after sorting and batching, retaining per-request generation and text stop semantics.
+    evidence: U42-U43
+  - id: CP5
+    required: false
+    file: llm_runtime.py
+    symbol: BatchEngine.generate_batch
+    lines: [474, 476]
+    behavior: Count each submitted prompt in the selected layout even when generation is served from cache.
+    evidence: U31-U32
+  - id: CP6
+    required: true
+    files: [lm_eval/api/model.py, lm_eval/models/codesense_batch.py]
+    symbols: [LM.response_cache_key, CodesenseBatchLM.response_cache_key, CachingLM.__getattr__, CacheHook.add_partial]
+    lines_by_file:
+      lm_eval/api/model.py: [225, 273, 276, 314, 349]
+      lm_eval/models/codesense_batch.py: [35]
+    behavior: Scope normal response writes, lookups and partial checkpoints identically across process lifetimes, retaining old keys for unscoped providers.
+    evidence: U44-U47

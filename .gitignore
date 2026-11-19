@@ -4,3 +4,6 @@ __pycache__/
 score*.json
 raw.json
 run-meta.json
+/repo/
+/environment/workspace/repo/
+.codesense-build-*/

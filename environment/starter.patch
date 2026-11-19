@@ -1,0 +1,690 @@
+diff --git a/docs/model_guide/codesense-batch.md b/docs/model_guide/codesense-batch.md
+new file mode 100644
+index 0000000..3039a6d
+--- /dev/null
++++ b/docs/model_guide/codesense-batch.md
+@@ -0,0 +1,72 @@
++# CPU batch-replay backend
++
++This backend replays generation requests through the Language Model Evaluation Harness without fetching weights. Use the normal registry and harness request type:
++
++```python
++from lm_eval.api.instance import Instance
++from lm_eval.api.registry import get_model
++
++backend = get_model("codesense-batch")(model="m1", tenant="local", mode="packed")
++row = Instance("generate_until", {}, ("parity", {"max_gen_toks": 4}), idx=0)
++result = backend.generate_until([row])
++```
++
++Text is encoded as UTF-8 bytes. Each returned token selects a character from
++`abcdefghijklmnopqrstuvwxyz01234` at its integer value modulo 31. A string
++or list of strings in `until` ends the returned text at the earliest matching
++position, excluding the marker. Empty markers are ignored. The adapter accepts
++`max_gen_toks` (default 4), `temperature` (default 0), `min_new_tokens`,
++`eos_token_id`, `context_length`, `seed` and `shard`. Generation is
++deterministic. Scoring likelihoods and stochastic sampling are unsupported.
++
++Choose a serving model, tenant, adapter and deployment revision when creating
++the backend. Each of these identifies an experiment; the caller updates its
++revision when deploying different weights. An unchanged experiment may resume
++from its completed results and per-request checkpoints after a process restart.
++A live model replacement or explicit reset starts a new deployment state even
++if another process has performed the same number of replacements. Unrelated
++model backends retain their existing saved responses.
++
++## Python serving API
++
++`llm_runtime.Request` accepts the original six positional fields: tenant,
++model, adapter, prompt, maximum number of new tokens, and temperature. The
++effective prompt retains the rightmost `context_length` tokens; a zero limit
++retains none, and an omitted limit retains all tokens. The limits and seed /
++shard are integers, with booleans excluded; length limits are nonnegative.
++Minimum new tokens may not exceed the maximum. An optional EOS id is an
++integer from 0 through 30. A finite real temperature and a finite nonnegative
++weight are required; booleans are not valid for either. The prompt may contain
++integers (including booleans), Unicode text, and bytes-like tokens. Distinct
++token types retain separate serving identities, even when their arithmetic
++contributions agree. Unknown models raise KeyError. Invalid requests raise
++ValueError before any row of the batch is dispatched.
++
++Use the registered backend's scalar `next_tokens` for continuation semantics,
++including injected models. Both padded and packed generation return one
++detached token list for each input row in its original position. A zero
++generation length yields an empty list without backend work. EOS is included
++at the first eligible token once the minimum length has been met. The optional
++`stop` and `stop_sequences` fields accept token markers or UTF-8 byte/text
++markers. Remove the earliest matching marker, including the token containing
++its first byte, without dropping below the minimum retained length.
++
++Sequence and prefix work from one serving experiment cannot satisfy another.
++Tenant identity includes type as well as value. Seed, shard, model, adapter and
++temperature are all part of the experiment context. Independent tenants
++receive independent backend work, even when the resulting text agrees.
++Replaying an unchanged batch does not repeat generation or prefill. Shared
++prefixes in the same context can reuse their prefilled tokens. The cold
++workload should dispatch at most one model call per eight compatible distinct
++nonempty generation requests, rounded up for each group; duplicate rows need
++only be generated once. Ignore request ids and scoring weights when deciding
++whether two model results are equal. Model replacement and cache clearing
++invalidate previously used state.
++
++`BatchEngine.stats["mode"]` identifies the current layout. For each input
++batch, cumulative `padded_tokens` increases by row count times the maximum
++effective prompt length in padded mode. Cumulative `packed_tokens` increases
++by the sum of all effective prompt lengths in packed mode. Include duplicate,
++cached, and zero-generation requests in these input counters. The other
++layout counter is unchanged. KVCache.put / get / clear retain their original
++behavior and len(cache) reports the number of distinct entries.
+diff --git a/llm_runtime.py b/llm_runtime.py
+new file mode 100644
+index 0000000..0fd90fb
+--- /dev/null
++++ b/llm_runtime.py
+@@ -0,0 +1,493 @@
++"""Deterministic CPU batch runtime for lm-eval replay and offline integration tests."""
++
++from bisect import bisect_right
++from dataclasses import dataclass, replace
++from inspect import signature
++import math
++from numbers import Integral, Real
++from typing import Any
++
++
++@dataclass(frozen=True)
++class Request:
++    """One deterministic generation request.
++
++    The first six fields are the original task API. Optional fields are
++    appended so old positional callers continue to work. ``request_id`` is
++    deliberately excluded from cache keys because two rows with the same
++    content should share work even when their ids are duplicated.
++    """
++
++    tenant: str
++    model: str
++    adapter: str
++    prompt: tuple[int, ...]
++    max_new_tokens: int = 4
++    temperature: float = 0.0
++    min_new_tokens: int = 0
++    eos_token_id: int | None = None
++    request_id: Any = None
++    weight: float = 1.0
++    # Optional byte/token-level stop sequences. Both names are accepted for
++    # compatibility with common serving APIs. They are after the original
++    # fields so old positional callers keep their meaning.
++    stop_sequences: tuple[Any, ...] = ()
++    stop: tuple[Any, ...] = ()
++    context_length: int | None = None
++    seed: int | None = None
++    shard: int | None = None
++
++
++def _freeze(value: Any) -> Any:
++    """Build a type-sensitive, hashable representation for cache keys."""
++
++    if isinstance(value, (bytearray, memoryview)):
++        return (type(value).__module__, type(value).__qualname__, bytes(value))
++    if isinstance(value, tuple):
++        return ("tuple", tuple(_freeze(item) for item in value))
++    if isinstance(value, list):
++        return ("list", tuple(_freeze(item) for item in value))
++    if isinstance(value, dict):
++        pairs = tuple(sorted((_freeze(k), _freeze(v)) for k, v in value.items()))
++        return ("dict", pairs)
++    try:
++        hash(value)
++    except TypeError:
++        return (type(value).__module__, type(value).__qualname__, repr(value))
++    return (type(value).__module__, type(value).__qualname__, value)
++
++
++def _is_int(value: Any) -> bool:
++    """Accept integer-like configuration values while excluding booleans."""
++
++    return isinstance(value, Integral) and not isinstance(value, bool)
++
++
++def _is_prompt_token(value: Any) -> bool:
++    """Return whether a prompt token has a deterministic byte/numeric value.
++
++    Integer tokens remain the normal path. ``str`` and bytes-like tokens are
++    accepted as well so byte-level and Unicode tokenizer fixtures can exercise
++    the runtime without a third-party tokenizer.
++    """
++
++    return isinstance(value, (Integral, str, bytes, bytearray, memoryview))
++
++
++def _token_value(value: Any) -> int:
++    """Map a prompt token to a stable arithmetic contribution."""
++
++    if isinstance(value, Integral):
++        return int(value)
++    if isinstance(value, str):
++        return sum((index + 1) * ord(char) for index, char in enumerate(value))
++    if isinstance(value, memoryview):
++        value = value.tobytes()
++    if isinstance(value, (bytes, bytearray)):
++        return sum((index + 1) * byte for index, byte in enumerate(value))
++    return sum((index + 1) * ord(char) for index, char in enumerate(str(value)))
++
++
++def _token_bytes(value: Any) -> bytes:
++    """Encode one token for byte-level stop matching."""
++
++    if isinstance(value, memoryview):
++        return value.tobytes()
++    if isinstance(value, bytes):
++        return value
++    if isinstance(value, bytearray):
++        return bytes(value)
++    if isinstance(value, str):
++        return value.encode("utf-8")
++    if isinstance(value, Integral):
++        number = int(value)
++        if 0 <= number <= 255:
++            return bytes((number,))
++        return str(number).encode("utf-8")
++    return str(value).encode("utf-8")
++
++
++def _stop_sequences(request: Request) -> tuple[Any, ...]:
++    """Normalize either stop field into one immutable sequence."""
++
++    values: list[Any] = []
++    for source in (request.stop_sequences, request.stop):
++        if source is None:
++            continue
++        if isinstance(source, (str, bytes, bytearray, memoryview, Integral)):
++            values.append(source)
++        else:
++            values.extend(source)
++    return tuple(values)
++
++
++class ToyModel:
++    """A deterministic model with scalar and batched execution counters."""
++
++    def __init__(self, model_id):
++        self.model_id = model_id
++        self.forward_calls = 0
++        self.batch_forward_calls = 0
++        self.prefill_calls = 0
++
++    def _raw_tokens(self, prompt, adapter, temperature, max_new_tokens):
++        salt = sum(ord(c) for c in (str(self.model_id) + str(adapter))) % 97
++        seed = (sum(_token_value(token) for token in prompt) + salt + int(temperature * 1000)) % 1000
++        return [((seed + i * 17) % 101) for i in range(max_new_tokens)]
++
++    def next_tokens(self, prompt, adapter, temperature, max_new_tokens):
++        self.forward_calls += 1
++        return self._raw_tokens(prompt, adapter, temperature, max_new_tokens)
++
++    def next_tokens_batch(
++        self, prompts, adapter, temperature, max_new_tokens, mode="padded"
++    ):
++        """Generate a compatible group with one model-forward accounting unit.
++
++        ``mode`` records the layout used by the scheduler. The toy model
++        computes from the unpadded prompt in either layout, making parity
++        between padded and packed execution explicit.
++        """
++
++        self.forward_calls += 1
++        self.batch_forward_calls += 1
++        return [
++            self._raw_tokens(prompt, adapter, temperature, max_new_tokens)
++            for prompt in prompts
++        ]
++
++    def prefill(self, tokens, adapter, temperature):
++        """Record a prefix prefill and return an immutable toy KV state."""
++
++        self.prefill_calls += 1
++        return (tuple(tokens), str(adapter), float(temperature))
++
++
++class KVCache:
++    """A copy-on-read/write cache suitable for token lists and prefix state."""
++
++    def __init__(self):
++        self._entries = {}
++
++    def get(self, prompt):
++        value = self._entries.get(_freeze(prompt))
++        if value is None:
++            return None
++        if isinstance(value, list):
++            return list(value)
++        return value
++
++    def put(self, prompt, value):
++        if isinstance(value, list):
++            value = list(value)
++        self._entries[_freeze(prompt)] = value
++
++    def clear(self):
++        self._entries.clear()
++
++    def contains(self, prompt):
++        return _freeze(prompt) in self._entries
++
++    def __len__(self):
++        return len(self._entries)
++
++
++class BatchEngine:
++    """Batch compatible requests while keeping deterministic request order."""
++
++    def __init__(self, models=None, mode="padded", pad_token_id=0):
++        self.models = {} if models is None else models
++        if mode not in {"padded", "packed"}:
++            raise ValueError("mode must be 'padded' or 'packed'")
++        self.mode = mode
++        self.pad_token_id = pad_token_id
++        self.cache = KVCache()
++        self.prefix_cache = KVCache()
++        self._generation = 0
++        self.stats = {
++            "mode": mode,
++            "batch_calls": 0,
++            "forward_calls": 0,
++            "prefix_hits": 0,
++            "padded_tokens": 0,
++            "packed_tokens": 0,
++        }
++        self.last_batch_mode = mode
++
++    def register(self, model):
++        self.models[model.model_id] = model
++        # A model object can retain different behavior under the same id.
++        self._generation += 1
++        self.cache.clear()
++        self.prefix_cache.clear()
++
++    def clear(self):
++        self._generation += 1
++        self.cache.clear()
++        self.prefix_cache.clear()
++
++    @staticmethod
++    def _validate_request(request):
++        if not _is_int(request.max_new_tokens):
++            raise ValueError("max_new_tokens must be an integer")
++        if not _is_int(request.min_new_tokens):
++            raise ValueError("min_new_tokens must be an integer")
++        if request.max_new_tokens < 0:
++            raise ValueError("max_new_tokens must be non-negative")
++        if request.min_new_tokens < 0:
++            raise ValueError("min_new_tokens must be non-negative")
++        if request.min_new_tokens > request.max_new_tokens:
++            raise ValueError("min_new_tokens cannot exceed max_new_tokens")
++        if request.eos_token_id is not None:
++            if not _is_int(request.eos_token_id):
++                raise ValueError("eos_token_id must be an integer or None")
++            if not 0 <= int(request.eos_token_id) < 31:
++                raise ValueError("eos_token_id must be within the tiny vocabulary")
++        if (
++            not isinstance(request.temperature, Real)
++            or isinstance(request.temperature, bool)
++            or not math.isfinite(float(request.temperature))
++        ):
++            raise ValueError("temperature must be finite")
++        if (
++            not isinstance(request.weight, Real)
++            or isinstance(request.weight, bool)
++            or not math.isfinite(float(request.weight))
++            or float(request.weight) < 0
++        ):
++            raise ValueError("weight must be a finite non-negative number")
++        if request.context_length is not None and (not _is_int(request.context_length) or request.context_length < 0):
++            raise ValueError("context_length must be a non-negative integer or None")
++        for name in ("seed", "shard"):
++            value = getattr(request, name, None)
++            if value is not None and not _is_int(value):
++                raise ValueError(f"{name} must be an integer or None")
++        try:
++            prompt = tuple(request.prompt)
++        except TypeError:
++            raise ValueError("prompt must be a sequence of token ids") from None
++        if not all(_is_prompt_token(token) for token in prompt):
++            raise ValueError("prompt values must be integer, text, or byte tokens")
++
++    def _context_key(self, request):
++        return (self._generation, request.model, float(request.temperature))
++
++    @staticmethod
++    def _effective_prompt(request):
++        prompt = tuple(request.prompt)
++        limit = request.context_length
++        return prompt if limit is None else (prompt[-limit:] if limit else ())
++
++    def _result_key(self, request):
++        """Key cached raw generations by every output-affecting option.
++
++        EOS/minimum and stop policies can make two rows with the same prompt
++        produce different raw lengths.  Keeping those options in the key
++        prevents a row from inheriting a shorter continuation generated for a
++        different stopping policy.  ``request_id`` and ``weight`` remain
++        metadata and deliberately stay out of the key.
++        """
++
++        return (
++            self._context_key(request),
++            _freeze(self._effective_prompt(request)),
++            int(request.max_new_tokens),
++            int(request.min_new_tokens),
++            None if request.eos_token_id is None else _freeze(request.eos_token_id),
++            _freeze(_stop_sequences(request)),
++        )
++
++    def _prefix_key(self, context, prefix):
++        return (context, _freeze(tuple(prefix)))
++
++    def _ensure_prefix(self, request, model):
++        """Populate prefix state and count reuse of a previously seen prefix."""
++
++        prompt = self._effective_prompt(request)
++        if not prompt:
++            return
++        context = self._context_key(request)
++        longest = 0
++        for length in range(len(prompt), 0, -1):
++            if self.prefix_cache.contains(self._prefix_key(context, prompt[:length])):
++                longest = length
++                break
++        if longest:
++            self.stats["prefix_hits"] += 1
++        if longest == len(prompt):
++            return
++        extension = prompt[longest:]
++        if hasattr(model, "prefill"):
++            state = model.prefill(extension, request.adapter, request.temperature)
++        else:
++            state = tuple(extension)
++        for length in range(longest + 1, len(prompt) + 1):
++            self.prefix_cache.put(self._prefix_key(context, prompt[:length]), state)
++
++    @staticmethod
++    def _apply_stop(tokens, request):
++        """Apply max/min, EOS, and byte/token-level stop policies.
++
++        Stop markers are removed from the returned continuation, matching the
++        usual text-generation API. Integer/tuple markers use token boundaries.
++        String and bytes markers are matched against UTF-8 bytes and can span
++        token boundaries. A marker cannot terminate before ``min_new_tokens``.
++        """
++
++        result = list(tokens[: request.max_new_tokens])
++        minimum = min(request.min_new_tokens, request.max_new_tokens)
++        eos = request.eos_token_id
++        if eos is not None:
++            for index, token in enumerate(result):
++                if token == eos and index + 1 >= minimum:
++                    result = result[: index + 1]
++                    break
++
++        markers = _stop_sequences(request)
++        if not markers:
++            return result
++
++        token_markers: list[tuple[Any, ...]] = []
++        byte_markers: list[bytes] = []
++        for marker in markers:
++            if isinstance(marker, (str, bytes, bytearray, memoryview)):
++                encoded = _token_bytes(marker)
++                if encoded:
++                    byte_markers.append(encoded)
++                continue
++            if isinstance(marker, Integral):
++                token_markers.append((marker,))
++            else:
++                try:
++                    sequence = tuple(marker)
++                except TypeError:
++                    continue
++                if sequence:
++                    token_markers.append(sequence)
++
++        cut = len(result)
++        for marker in token_markers:
++            width = len(marker)
++            for end in range(max(minimum, width), len(result) + 1):
++                if tuple(result[end - width : end]) == marker:
++                    candidate = end - width
++                    # Removing a marker must never shorten the continuation
++                    # below min_new_tokens.  Keep scanning for a later marker.
++                    if candidate >= minimum:
++                        cut = min(cut, candidate)
++                        break
++
++        if byte_markers:
++            # Search only the byte stream following the minimum number of
++            # retained tokens. Return whole tokens even for a match beginning
++            # or ending inside a multi-byte token.
++            stream = bytearray()
++            starts = []
++            for token in result[minimum:]:
++                starts.append(len(stream))
++                stream.extend(_token_bytes(token))
++            for marker in byte_markers:
++                position = stream.find(marker)
++                if position >= 0:
++                    token_index = minimum + bisect_right(starts, position) - 1
++                    cut = min(cut, token_index)
++
++        return result[:cut]
++
++    def _run_model_batch(self, model, requests, mode):
++        prompts = [self._effective_prompt(request) for request in requests]
++        max_tokens = max(request.max_new_tokens for request in requests)
++        batch_method = getattr(model, "next_tokens_batch", None)
++        if batch_method is None:
++            values = []
++            for request, prompt in zip(requests, prompts):
++                self.stats["forward_calls"] += 1
++                values.append(model.next_tokens(
++                    prompt, request.adapter, request.temperature, request.max_new_tokens
++                ))
++            return values
++
++        first = requests[0]
++        args = (prompts, first.adapter, first.temperature, max_tokens)
++        # Some older backends only accept four positional arguments. Choose
++        # the calling convention before executing the backend; a TypeError
++        # raised by the actual model must not trigger another forward.
++        kwargs = {"mode": mode}
++        try:
++            method_signature = signature(batch_method)
++        except (ValueError, TypeError):
++            pass  # Uninspectable backends use the documented, mode-aware API.
++        else:
++            try:
++                method_signature.bind(*args, **kwargs)
++            except TypeError:
++                method_signature.bind(*args)
++                kwargs = {}
++        self.stats["forward_calls"] += 1
++        return batch_method(*args, **kwargs)
++
++    def generate(self, request):
++        return self.generate_batch([request], mode=self.mode)[0]
++
++    def generate_batch(self, requests, mode=None):
++        requests = list(requests)
++        mode = self.mode if mode is None else mode
++        if mode not in {"padded", "packed"}:
++            raise ValueError("mode must be 'padded' or 'packed'")
++        normalized = []
++        lengths = []
++        for request in requests:
++            if not isinstance(request.prompt, tuple):
++                try:
++                    prompt = tuple(request.prompt)
++                except TypeError:
++                    raise ValueError("prompt must be a sequence of tokens") from None
++                request = replace(request, prompt=prompt)
++            self._validate_request(request)
++            if request.model not in self.models:
++                raise KeyError(request.model)
++            normalized.append(request)
++            lengths.append(len(self._effective_prompt(request)))
++
++        # Layout counters describe the submitted batch, regardless of the
++        # grouping and cache hits that reduce actual backend work.
++        self.last_batch_mode = self.stats["mode"] = mode
++        self.stats["batch_calls"] += 1
++        if mode == "padded":
++            self.stats["padded_tokens"] += max(lengths, default=0) * len(lengths)
++        else:
++            self.stats["packed_tokens"] += sum(lengths)
++
++        outputs = [[] for _ in normalized]
++        groups = {}
++        for index, request in enumerate(normalized):
++            if not request.max_new_tokens:
++                continue
++            context = self._context_key(request)
++            key = self._result_key(request)
++            cached = self.cache.get(key)
++            if cached is not None:
++                outputs[index] = self._apply_stop(cached, request)
++                continue
++            # Keep all original positions for each distinct cache miss. This
++            # allows one forward per unique row and a linear-time scatter.
++            pending = groups.setdefault(context, {})
++            if key not in pending:
++                pending[key] = (request, [])
++            pending[key][1].append(index)
++
++        for pending in groups.values():
++            rows = [request for request, _ in pending.values()]
++            model = self.models[rows[0].model]
++            for request in rows:
++                self._ensure_prefix(request, model)
++            raw_values = list(self._run_model_batch(model, rows, mode))
++            if len(raw_values) != len(rows):
++                raise ValueError("backend returned a different number of rows than requested")
++            for (key, (request, positions)), raw in zip(pending.items(), raw_values):
++                raw = list(raw)
++                self.cache.put(key, raw)
++                stopped = self._apply_stop(raw, request)
++                for index in positions:
++                    outputs[index] = list(stopped)
++        return outputs
+diff --git a/lm_eval/models/__init__.py b/lm_eval/models/__init__.py
+index f6e1932..d9263c6 100644
+--- a/lm_eval/models/__init__.py
++++ b/lm_eval/models/__init__.py
+@@ -26,6 +26,7 @@ MODEL_MAPPING = {
+     "anthropic-chat": "lm_eval.models.anthropic_llms:AnthropicChat",
+     "anthropic-chat-completions": "lm_eval.models.anthropic_llms:AnthropicChat",
+     "anthropic-completions": "lm_eval.models.anthropic_llms:AnthropicLM",
++    "codesense-batch": "lm_eval.models.codesense_batch:CodesenseBatchLM",
+     "dummy": "lm_eval.models.dummy:DummyLM",
+     "ggml": "lm_eval.models.gguf:GGUFLM",
+     "gguf": "lm_eval.models.gguf:GGUFLM",
+diff --git a/lm_eval/models/codesense_batch.py b/lm_eval/models/codesense_batch.py
+new file mode 100644
+index 0000000..5135538
+--- /dev/null
++++ b/lm_eval/models/codesense_batch.py
+@@ -0,0 +1,81 @@
++"""CPU-only deterministic generation backend for replaying evaluation batches.
++
++Install the local harness checkout and select `--model codesense-batch`.
++Generation consumes UTF-8 bytes. Each output token indexes the repeatable
++alphabet below, allowing requests to be compared without a tokenizer download.
++"""
++
++from lm_eval.api.model import LM
++from lm_eval.api.registry import register_model
++from lm_eval.models.utils import Collator
++
++from llm_runtime import BatchEngine, Request, ToyModel
++
++
++_ALPHABET = "abcdefghijklmnopqrstuvwxyz01234"
++
++
++@register_model("codesense-batch")
++class CodesenseBatchLM(LM):
++    def __init__(
++        self, model="m1", tenant="local", adapter="", revision="1",
++        mode="packed", batch_size=64, engine=None,
++    ):
++        super().__init__()
++        self.model_name = model
++        self.tenant = tenant
++        self.adapter = adapter
++        self.revision = revision
++        self.mode = mode
++        self.replay_batch_size = int(batch_size)
++        if self.replay_batch_size < 1:
++            raise ValueError("batch_size must be positive")
++        self.engine = BatchEngine(models={model: ToyModel(model)}) if engine is None else engine
++
++    def generate_until(self, requests, disable_tqdm=False):
++        """Replay native (context, generation kwargs) pairs in scheduled batches."""
++        rows = []
++        for instance in requests:
++            context, options = instance.args
++            if not isinstance(context, str):
++                raise ValueError("generation requires a text context")
++            if options.get("do_sample", False):
++                raise ValueError("the replay backend supports deterministic generation only")
++            stops = options.get("until", ())
++            if isinstance(stops, str):
++                stops = (stops,)
++            if not isinstance(stops, (list, tuple)) or not all(isinstance(s, str) for s in stops):
++                raise ValueError("until must be a string or a sequence of strings")
++            request = Request(
++                tenant=self.tenant,
++                model=self.model_name,
++                adapter=self.adapter,
++                prompt=tuple(context.encode("utf-8")),
++                max_new_tokens=options.get("max_gen_toks", 4),
++                temperature=options.get("temperature", 0.0),
++                request_id=instance.idx,
++                min_new_tokens=options.get("min_new_tokens", 0),
++                eos_token_id=options.get("eos_token_id"),
++                context_length=options.get("context_length"),
++                seed=options.get("seed"),
++                shard=options.get("shard"),
++            )
++            rows.append((request, tuple(stops), instance.args))
++
++        batches = Collator(rows, sort_fn=lambda row: -len(row[0].prompt))
++        outputs = []
++        for batch in batches.get_batched(n=self.replay_batch_size):
++            raw = self.engine.generate_batch([row for row, _, _ in batch], mode=self.mode)
++            for tokens, (_, stops, args) in zip(raw, batch, strict=True):
++                text = "".join(_ALPHABET[token % len(_ALPHABET)] for token in tokens)
++                matches = [text.index(stop) for stop in stops if stop and stop in text]
++                reply = text[:min(matches)] if matches else text
++                self.cache_hook.add_partial("generate_until", args, reply)
++                outputs.append(reply)
++        return outputs
++
++    def loglikelihood(self, requests, disable_tqdm=False):
++        raise NotImplementedError("this replay backend only supports generate_until")
++
++    def loglikelihood_rolling(self, requests, disable_tqdm=False):
++        raise NotImplementedError("this replay backend only supports generate_until")
+diff --git a/pyproject.toml b/pyproject.toml
+index 1207dc5..7558cbb 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -34,6 +34,9 @@ dependencies = [
+     "tqdm>=4.59.0"
+ ]
+ 
++[tool.setuptools]
++py-modules = ["llm_runtime"]
++
+ [tool.setuptools.packages.find]
+ include = ["lm_eval*"]
+ 

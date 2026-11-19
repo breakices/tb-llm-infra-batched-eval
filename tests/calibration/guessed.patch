@@ -1,0 +1,116 @@
+diff --git a/llm_runtime.py b/llm_runtime.py
+--- a/llm_runtime.py
++++ b/llm_runtime.py
+@@ -6,6 +6,7 @@
+ import math
+ from numbers import Integral, Real
+ from typing import Any
++from uuid import uuid4
+ 
+ 
+ @dataclass(frozen=True)
+@@ -203,7 +204,7 @@
+         self.pad_token_id = pad_token_id
+         self.cache = KVCache()
+         self.prefix_cache = KVCache()
+-        self._generation = 0
++        self._generation = None
+         self.stats = {
+             "mode": mode,
+             "batch_calls": 0,
+@@ -214,15 +215,20 @@
+         }
+         self.last_batch_mode = mode
+ 
++    @property
++    def deployment_state(self):
++        """Only a declared initial deployment is shared across process restarts."""
++        return self._generation
++
+     def register(self, model):
+         self.models[model.model_id] = model
+         # A model object can retain different behavior under the same id.
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+     def clear(self):
+-        self._generation += 1
++        self._generation = uuid4().hex
+         self.cache.clear()
+         self.prefix_cache.clear()
+ 
+@@ -270,7 +276,18 @@
+             raise ValueError("prompt values must be integer, text, or byte tokens")
+ 
+     def _context_key(self, request):
+-        return (self._generation, request.model, float(request.temperature))
++        model = self.models.get(request.model)
++        return (
++            self._generation,
++            _freeze(request.tenant),
++            _freeze(request.model),
++            id(model),
++            _freeze(request.adapter),
++            ("temperature", float(request.temperature)),
++            request.context_length,
++            request.seed,
++            request.shard,
++        )
+ 
+     @staticmethod
+     def _effective_prompt(request):
+@@ -279,23 +296,7 @@
+         return prompt if limit is None else (prompt[-limit:] if limit else ())
+ 
+     def _result_key(self, request):
+-        """Key cached raw generations by every output-affecting option.
+-
+-        EOS/minimum and stop policies can make two rows with the same prompt
+-        produce different raw lengths.  Keeping those options in the key
+-        prevents a row from inheriting a shorter continuation generated for a
+-        different stopping policy.  ``request_id`` and ``weight`` remain
+-        metadata and deliberately stay out of the key.
+-        """
+-
+-        return (
+-            self._context_key(request),
+-            _freeze(self._effective_prompt(request)),
+-            int(request.max_new_tokens),
+-            int(request.min_new_tokens),
+-            None if request.eos_token_id is None else _freeze(request.eos_token_id),
+-            _freeze(_stop_sequences(request)),
+-        )
++        return _freeze(self._effective_prompt(request))
+ 
+     def _prefix_key(self, context, prefix):
+         return (context, _freeze(tuple(prefix)))
+diff --git a/lm_eval/models/codesense_batch.py b/lm_eval/models/codesense_batch.py
+--- a/lm_eval/models/codesense_batch.py
++++ b/lm_eval/models/codesense_batch.py
+@@ -31,6 +31,15 @@
+         if self.replay_batch_size < 1:
+             raise ValueError("batch_size must be positive")
+         self.engine = BatchEngine(models={model: ToyModel(model)}) if engine is None else engine
++
++    def response_cache_key(self, attr, args):
++        # A saved result is reusable across restarts and compatible layouts
++        # within an unchanged serving deployment.
++        from lm_eval.api.model import hash_args
++
++        scope = ["codesense-batch-v1", self.model_name, self.tenant, self.adapter,
++                 self.revision, self.engine.deployment_state]
++        return "codesense:" + hash_args(attr, [scope, *args])
+ 
+     def generate_until(self, requests, disable_tqdm=False):
+         """Replay native (context, generation kwargs) pairs in scheduled batches."""
+@@ -72,7 +81,7 @@
+                 reply = text[:min(matches)] if matches else text
+                 self.cache_hook.add_partial("generate_until", args, reply)
+                 outputs.append(reply)
+-        return outputs
++        return batches.get_original(outputs)
+ 
+     def loglikelihood(self, requests, disable_tqdm=False):
+         raise NotImplementedError("this replay backend only supports generate_until")

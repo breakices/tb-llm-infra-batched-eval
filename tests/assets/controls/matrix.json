@@ -1,0 +1,109 @@
+{
+  "image": "sha256:97ab7d1c89981b22973505e55ba9df9358943fb09b5b24d9ec62886a708a2455",
+  "repetitions": 3,
+  "profiles": {
+    "nop": {
+      "reward": 0.0,
+      "ut_total": 47,
+      "ut_passed": 36,
+      "case_total": 429,
+      "case_passed": 252,
+      "failures": [
+        "U21",
+        "U23",
+        "U24",
+        "U36",
+        "U39",
+        "U40",
+        "U41",
+        "U42",
+        "U45",
+        "U46",
+        "U47"
+      ],
+      "patch_sha256": null
+    },
+    "golden": {
+      "reward": 1.0,
+      "ut_total": 47,
+      "ut_passed": 47,
+      "case_total": 429,
+      "case_passed": 429,
+      "failures": [],
+      "patch_sha256": "89ad81bd09c7502cc8b31d3a802bbcbb4def7eaa9a4c6df465a5fd2d37da4afb"
+    },
+    "full_score": {
+      "reward": 1.0,
+      "ut_total": 47,
+      "ut_passed": 47,
+      "case_total": 429,
+      "case_passed": 429,
+      "failures": [],
+      "patch_sha256": "89ad81bd09c7502cc8b31d3a802bbcbb4def7eaa9a4c6df465a5fd2d37da4afb"
+    },
+    "equivalent": {
+      "reward": 1.0,
+      "ut_total": 47,
+      "ut_passed": 47,
+      "case_total": 429,
+      "case_passed": 429,
+      "failures": [],
+      "patch_sha256": "85a5949bcb4cc0a20bd3074d92440687e205198b982066a615cc5d67904b652b"
+    },
+    "variant_a": {
+      "reward": 1.0,
+      "ut_total": 47,
+      "ut_passed": 47,
+      "case_total": 429,
+      "case_passed": 429,
+      "failures": [],
+      "patch_sha256": "198498d5467f14cb57263ee82cb0b469ce78df7080253b492b988930790c507f"
+    },
+    "variant_b": {
+      "reward": 1.0,
+      "ut_total": 47,
+      "ut_passed": 47,
+      "case_total": 429,
+      "case_passed": 429,
+      "failures": [],
+      "patch_sha256": "10c0eb3890ec0168b49f105d7aed411cbfc6c2f9a4d4e554560700027554ca82"
+    },
+    "guessed": {
+      "reward": 0.0,
+      "ut_total": 47,
+      "ut_passed": 37,
+      "case_total": 429,
+      "case_passed": 419,
+      "failures": [
+        "U21",
+        "U22",
+        "U23",
+        "U26",
+        "U36",
+        "U38",
+        "U41",
+        "U45",
+        "U46",
+        "U47"
+      ],
+      "patch_sha256": "9412bd014fcb786be31da88667bb578760ffb0da890bfe157714d84c32321d09"
+    },
+    "defective": {
+      "reward": 0.0,
+      "ut_total": 47,
+      "ut_passed": 40,
+      "case_total": 429,
+      "case_passed": 422,
+      "failures": [
+        "U5",
+        "U6",
+        "U23",
+        "U25",
+        "U41",
+        "U46",
+        "U47"
+      ],
+      "patch_sha256": "050c1ad2ea6cd24a72a232a1801266bcfc886f6723fc7934e00489212007ab05"
+    }
+  }
+}
