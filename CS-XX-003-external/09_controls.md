@@ -1,5 +1,10 @@
-# 参考实现与四个校准样例
+# 标杆样例与逐项结果
 
-`solution/golden/golden.patch` 从可见的起始仓库得到参考实现。`tests/calibration/` 中的 full_score、equivalent、defective、guessed 分别给出完整提交和运行结果单，另两种可接受实现及比较说明在 `solution/variants/`。每份补丁都从起始仓库单独应用。
+从同一起始仓库分别应用四份补丁，逐项判分单随补丁提供。
 
-交付前在同一环境检查 full_score 和 equivalent 全通过，guessed 错在其针对的断言，defective 的每处错误都被对应检查捕获。重复程序自检属于判分稳定性证据。正式模型结果另见 `06_baseline.md`。
+- [满分样例](../tests/calibration/full_score.patch) · [结果](../tests/calibration/full_score_result.md)
+- [等价样例](../tests/calibration/equivalent.patch) · [结果](../tests/calibration/equivalent_result.md)
+- [缺陷样例](../tests/calibration/defective.patch) · [结果](../tests/calibration/defective_result.md)
+- [草稿样例](../tests/calibration/guessed.patch) · [结果](../tests/calibration/guessed_result.md)
+
+两种补充实现见[变体说明](../solution/variants/README.md)。

@@ -96,9 +96,9 @@ def generate():
                      flagged, *scores, "tests/assets/selfcheck.md", "是" if stable_three else "待完成",
                      "opensource", data["code_license"], "公开上游代码与新写回放后端",
                      EXTERNAL + "/07_provenance_similarity.md",
-                     "未完成当前题面五模型各五次独立校准及平台样包导入",
-                     "4.0.0 使用真实 harness 和候选驱动的独立验收，3.x 成绩仅供开发参考",
-                     "calibration_incomplete"])
+                     "4.0.0 正式答卷 0/25；平台样包尚未导入",
+                     "4.0.0 更换上游快照并重建批处理与持久缓存验收",
+                     "待复验"])
     return {"task.toml": metadata, EXTERNAL + "/02_ut_list.md": "\n".join(catalog) + "\n",
             EXTERNAL + "/03_prompt_ut_evidence_map.md": "\n".join(mapping) + "\n",
             "manifest.csv": manifest.getvalue()}
